@@ -361,18 +361,6 @@ The LUNA Agent is an autonomous agentic flow that interacts with users via Slack
 - LUNA configuration file `/.luna/luna.env` created from `luna.env.template`
 - GitHub CLI (gh) installed for automatic PR creation: `sudo apt install gh`
 
-**Setup LUNA Configuration (as luna user):**
-```bash
-# Create the configuration directory in your home
-mkdir -p ~/.luna
-
-# Copy the template and edit it with your tokens
-cp luna.env.template ~/.luna/luna.env
-nano ~/.luna/luna.env
-
-# Secure the configuration file
-chmod 600 ~/.luna/luna.env
-```
 
 **Verify Prerequisites:**
 ```bash
