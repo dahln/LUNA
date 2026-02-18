@@ -348,51 +348,6 @@ async Task<string> CopyFileFromContainer(string containerId, string containerPat
     return await RunCommand($"docker cp {containerId}:{containerPath} {localPath}");
 }
 
-async Task<(string? branchName, string? repoPath)> CreateGitBranch(int taskId, string taskDescription)
-{
-    try
-    {
-        var sanitized = new string(taskDescription.Take(30).Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray());
-        var branchName = $"luna-task-{taskId}-{sanitized}".ToLower();
-        var repoPath = Path.Combine("/tmp", $"luna-repo-{taskId}");
-
-        // Check if we're in a git repo or need to create a new one
-        var gitConfigOutput = await RunCommand("git config --get remote.origin.url");
-        
-        if (string.IsNullOrEmpty(gitConfigOutput) || gitConfigOutput.Contains("Error"))
-        {
-            // Create a new repository
-            Directory.CreateDirectory(repoPath);
-            await RunCommand("git init", repoPath);
-            await RunCommand("git config user.name 'LUNA Agent'", repoPath);
-            await RunCommand("git config user.email 'luna-agent@localhost'", repoPath);
-            
-            // Try to get GitHub username from SSH config
-            var githubUser = await RunCommand("git config --get user.name || echo 'luna-agent'");
-            githubUser = githubUser.Trim();
-            
-            await LogToDb(taskId, $"Created new repository at {repoPath}");
-        }
-        else
-        {
-            // Use existing repository
-            var currentDir = Directory.GetCurrentDirectory();
-            repoPath = currentDir;
-        }
-
-        // Create and checkout branch
-        await RunCommand($"git checkout -b {branchName}", repoPath);
-        await LogToDb(taskId, $"Created branch: {branchName}");
-
-        return (branchName, repoPath);
-    }
-    catch (Exception ex)
-    {
-        await LogToDb(taskId, $"Error creating branch: {ex.Message}");
-        return (null, null);
-    }
-}
-
 async Task<string?> CreatePullRequest(int taskId, string branchName, string repoPath, string taskDescription)
 {
     try
@@ -683,22 +638,9 @@ async Task DeliverNonCodingTask(int taskId, string taskFolder, ISlackApiClient s
             }
             else
             {
-                // For binary files, upload to Slack
-                try
-                {
-                    var fileBytes = await System.IO.File.ReadAllBytesAsync(file);
-                    await slack.Files.Upload(
-                        content: fileBytes,
-                        filename: Path.GetFileName(file),
-                        channels: new[] { agentChannelId },
-                        title: $"Task #{taskId} - {relativePath}"
-                    );
-                    await SendSlackMessage(slack, $"📎 Uploaded: {relativePath}");
-                }
-                catch (Exception ex)
-                {
-                    await LogToDb(taskId, $"Error uploading file {relativePath}: {ex.Message}");
-                }
+                // For binary files, inform user about the file
+                await SendSlackMessage(slack, $"📎 Binary file created: {relativePath} (size: {fileInfo.Length} bytes)");
+                await LogToDb(taskId, $"Binary file: {relativePath}");
             }
         }
         
