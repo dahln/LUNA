@@ -32,6 +32,7 @@ var dbPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Us
 var slackBotToken = "";
 var slackAppToken = "";
 var agentChannelId = "";
+var agentUserId = "";
 
 // AI Configuration
 const double OllamaTemperature = 0.7;
@@ -83,6 +84,10 @@ using (var db = new AgentDbContext())
 {
     db.Database.EnsureCreated();
 }
+
+// Clean up any stale containers from previous runs
+Console.WriteLine("🧹 Cleaning up stale Docker containers...");
+await CleanupStaleContainers();
 
 // ============================================================================
 // Task Queue Management
@@ -257,7 +262,9 @@ async Task<(bool success, string containerId, string output)> CreateTaskContaine
 {
     try
     {
-        var containerName = $"luna-task-{taskId}";
+        // Use unique container name with timestamp to avoid conflicts
+        var uniqueSuffix = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var containerName = $"luna-task-{taskId}-{uniqueSuffix}";
         
         // Create a Docker container with necessary tools
         var createCommand = $"docker run -d --name {containerName} " +
@@ -485,6 +492,37 @@ async Task<(bool isRunning, string modelInfo)> GetOllamaStatusAsync()
         // Ollama not responding
     }
     return (false, "Not responding");
+}
+
+async Task CleanupStaleContainers()
+{
+    try
+    {
+        // List all containers matching luna-task pattern
+        var output = await RunCommand("docker ps -a --filter=\"name=luna-task\" --format=\"{{.Names}}\"");
+        if (string.IsNullOrWhiteSpace(output))
+            return;
+
+        var containerNames = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var containerName in containerNames)
+        {
+            try
+            {
+                // Try to stop and remove each container
+                await RunCommand($"docker stop {containerName} 2>/dev/null || true");
+                await RunCommand($"docker rm {containerName} 2>/dev/null || true");
+                Console.WriteLine($"🧹 Cleaned up stale container: {containerName}");
+            }
+            catch
+            {
+                // Ignore individual cleanup failures
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Warning: Error during container cleanup: {ex.Message}");
+    }
 }
 
 // ============================================================================
@@ -750,8 +788,11 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
         if (message.Channel != agentChannelId || message.User == null)
             return;
 
+        // Skip messages from the agent itself to prevent feedback loops
+        if (message.User == agentUserId)
+            return;
+
         var text = message.Text?.Trim() ?? "";
-        Console.WriteLine($"Received message: {text}");
 
         // Parse commands (use ! prefix since Slack intercepts / as slash commands)
         if (text.StartsWith("!status"))
@@ -926,20 +967,20 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
         {
             var helpMsg = @"🤖 **LUNA Agent Commands**
 
-**/status** - Show current task and queue
-**/details <task_id>** - Get details about a specific task
-**/queue** - Show all queued and paused tasks
-**/pause <task_id>** - Pause a queued task
-**/start <task_id>** - Start a task (pauses current task if needed, starts or resumes specified task)
-**/stop <task_id>** - Stop a task
-**/system** - Get current system status (CPU, RAM, temperature, Ollama)
-/**/help** - Show this help message
+**!status** - Show current task and queue
+**!details <task_id>** - Get details about a specific task
+**!queue** - Show all queued and paused tasks
+**!pause <task_id>** - Pause a queued task
+**!start <task_id>** - Start a task (pauses current task if needed, starts or resumes specified task)
+**!stop <task_id>** - Stop a task
+**!system** - Get current system status (CPU, RAM, temperature, Ollama)
+**!help** - Show this help message
 
 **To create a new task**, simply send a message describing what you want me to do!";
 
             await SendSlackMessage(slack, helpMsg);
         }
-        else if (text.StartsWith("/system"))
+        else if (text.StartsWith("!system"))
         {
             var (cpu, ram, temp) = await GetSystemStats();
             var (ollamaRunning, ollamaInfo) = await GetOllamaStatusAsync();
@@ -950,7 +991,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
                           $"Ollama: {(ollamaRunning ? "✅" : "❌")} {ollamaInfo}";
             await SendSlackMessage(slack, statusMessage);
         }
-        else if (!string.IsNullOrEmpty(text) && !text.StartsWith("/"))
+        else if (!string.IsNullOrEmpty(text) && !text.StartsWith("!") && !text.StartsWith("/"))
         {
             // Create new task from message
             using var db = new AgentDbContext();
@@ -988,6 +1029,11 @@ Console.WriteLine("Connecting to Slack...");
 
 var client = new SlackApiClient(slackBotToken);
 
+// Get the agent's own bot user ID to filter out its own messages
+var authTest = await client.Auth.Test();
+agentUserId = authTest.UserId;
+Console.WriteLine($"Agent User ID: {agentUserId}");
+
 await SendSlackMessage(client, "🚀 LUNA Agent is online and ready!");
 
 // Start task worker
@@ -1014,35 +1060,49 @@ var pollTask = Task.Run(async () =>
                     
                     if (history.Messages != null && history.Messages.Any())
                     {
+                        Console.WriteLine($"📨 Retrieved {history.Messages.Count} messages from channel");
+                        
                         // Get timestamp from message (Slack uses Unix seconds as string)
                         var newMessages = history.Messages
                             .Where(m => {
-                                // Skip system messages
-                                if (string.IsNullOrWhiteSpace(m.Text) || 
-                                    m.Text.Contains("joined the channel") ||
-                                    m.Text.Contains("LUNA Agent is online") ||
-                                    m.Text.Contains("has joined") ||
-                                    m.User == null)
+                                // Skip system messages (no verbose logging for normal filtering)
+                                if (string.IsNullOrWhiteSpace(m.Text))
                                     return false;
                                 
-                                // Parse Slack timestamp (format: "1234567890.123456")
-                                if (double.TryParse(m.Timestamp.ToString("F6"), out var msgTimestamp))
-                                    return msgTimestamp > lastMessageTimestamp && 
-                                           !processedMessageTimestamps.Contains(m.Timestamp.ToString());
-                                return false;
+                                if (m.Text.Contains("joined the channel") ||
+                                    m.Text.Contains("LUNA Agent is online") ||
+                                    m.Text.Contains("has joined"))
+                                    return false;
+                                
+                                if (m.User == null)
+                                    return false;
+                                
+                                // Convert DateTime to Unix timestamp for comparison
+                                var msgTimestamp = new DateTimeOffset(m.Timestamp, TimeSpan.Zero).ToUnixTimeSeconds();
+                                if (msgTimestamp <= lastMessageTimestamp)
+                                    return false;
+                                
+                                if (processedMessageTimestamps.Contains(m.Timestamp.ToString("O")))
+                                    return false;
+                                
+                                // Found a new message
+                                return true;
                             })
                             .OrderBy(m => m.Timestamp)
                             .ToList();
+
+                        if (newMessages.Count > 0)
+                            Console.WriteLine($"📨 Found {newMessages.Count} new message(s)");
 
                         foreach (var message in newMessages)
                         {
                             try
                             {
-                                var messageTimestampStr = message.Timestamp.ToString("F6");
-                                if (double.TryParse(messageTimestampStr, out var ts))
-                                    lastMessageTimestamp = ts;
+                                // Update lastMessageTimestamp for next poll cycle
+                                var msgTimestamp = new DateTimeOffset(message.Timestamp, TimeSpan.Zero).ToUnixTimeSeconds();
+                                lastMessageTimestamp = msgTimestamp;
                                 
-                                processedMessageTimestamps.Add(messageTimestampStr);
+                                processedMessageTimestamps.Add(message.Timestamp.ToString("O"));
 
                                 // Convert to MessageEvent and handle
                                 if (message.User != null && !string.IsNullOrWhiteSpace(message.Text))
@@ -1068,7 +1128,7 @@ var pollTask = Task.Run(async () =>
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"⚠️  Error polling messages: {ex.Message}");
+                Console.WriteLine($"⚠️  Error polling messages: {ex.Message}\n{ex.StackTrace}");
             }
 
             // Poll every 5 seconds
