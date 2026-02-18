@@ -419,7 +419,7 @@ Environment=HOME=/home/luna
 EnvironmentFile=/home/luna/.luna/luna.env
 
 # Start the agent
-ExecStart=/home/luna/.dotnet/dotnet screen.cs
+ExecStart=/home/luna/.dotnet/dotnet luna-agent.cs
 
 # Restart policy
 Restart=on-failure
@@ -518,7 +518,7 @@ The agent will:
   - User updates and streaming messages
   - Command outputs and observations
   - Action details and results
-- Agent can iterate up to 10 times per task
+- Agent can iterate up to 100 times per task
 - Agent will ask for user input if needed
 - All interactions are logged to facilitate task resume/restart
 
