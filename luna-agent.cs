@@ -44,8 +44,8 @@ const int MaxTaskIterations = 100;
 const int MaxSlackMessagePreviewLength = 500;
 const int MaxDescriptionPreviewLength = 50;
 const int MaxLogPreviewLength = 2000;
-const int MaxContextHistoryEntryLength = 500;
-const int MaxErrorMessagePreviewLength = 200;
+const int MaxContextHistoryEntryLength = 5000;
+const int MaxErrorMessagePreviewLength = 2000;
 
 // Load Slack tokens from file
 if (System.IO.File.Exists(slackConfigFile))
@@ -987,7 +987,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
                 var updateText = parts[2];
                 using var db = new AgentDbContext();
                 var task = await db.Tasks.FindAsync(taskId);
-                if (task != null && task.Status == TaskStatus.Running)
+                if (task != null && (task.Status == TaskStatus.Running || task.Status == TaskStatus.Queued))
                 {
                     // Append update to task description for AI context
                     task.Description += $"\n\nUser Update: {updateText}";
@@ -997,11 +997,18 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
                     await LogToDb(taskId, $"User update: {updateText}");
                     await LogThought(taskId, 0, ThoughtType.UserUpdate, $"User provided update: {updateText}");
                     
-                    await SendSlackMessage(slack, $"✅ Update sent to task #{taskId}. AI will see this in the next iteration.");
+                    if (task.Status == TaskStatus.Running)
+                    {
+                        await SendSlackMessage(slack, $"✅ Update sent to task #{taskId}. AI will see this in the next iteration.");
+                    }
+                    else if (task.Status == TaskStatus.Queued)
+                    {
+                        await SendSlackMessage(slack, $"✅ Update sent to queued task #{taskId}. AI will see this when the task starts.");
+                    }
                 }
                 else
                 {
-                    await SendSlackMessage(slack, $"Cannot update task #{taskId} - must be currently running");
+                    await SendSlackMessage(slack, $"Cannot update task #{taskId} - task not found or already completed");
                 }
             }
             else
