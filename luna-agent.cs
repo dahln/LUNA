@@ -187,8 +187,29 @@ async Task<string> CallOllama(string prompt, string? model = null)
         if (response.IsSuccessStatusCode)
         {
             var responseJson = await response.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(responseJson);
-            return doc.RootElement.GetProperty("response").GetString() ?? "";
+            
+            // Validate response is not empty
+            if (string.IsNullOrWhiteSpace(responseJson))
+            {
+                Console.WriteLine("⚠️  Ollama returned empty response");
+                return "";
+            }
+            
+            try
+            {
+                using var doc = JsonDocument.Parse(responseJson);
+                return doc.RootElement.GetProperty("response").GetString() ?? "";
+            }
+            catch (JsonException jex)
+            {
+                Console.WriteLine($"⚠️  Failed to parse Ollama JSON response: {jex.Message}");
+                Console.WriteLine($"   Response was: {responseJson.Substring(0, Math.Min(200, responseJson.Length))}...");
+                return "";
+            }
+        }
+        else
+        {
+            Console.WriteLine($"⚠️  Ollama HTTP error: {response.StatusCode}");
         }
     }
     catch (Exception ex)
@@ -974,7 +995,8 @@ var workerTask = Task.Run(async () => await TaskWorker(client));
 
 // Start message polling for real-time message handling
 Console.WriteLine("Setting up message polling...");
-var lastMessageTimestamp = 0.0;
+// Initialize to current time so we only process NEW messages (not historical)
+var lastMessageTimestamp = (double)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 var processedMessageTimestamps = new HashSet<string>();
 
 var pollTask = Task.Run(async () =>
@@ -992,30 +1014,53 @@ var pollTask = Task.Run(async () =>
                     
                     if (history.Messages != null && history.Messages.Any())
                     {
+                        // Get timestamp from message (Slack uses Unix seconds as string)
                         var newMessages = history.Messages
-                            .Where(m => m.Timestamp.Ticks > lastMessageTimestamp &&
-                                   !processedMessageTimestamps.Contains(m.Timestamp.Ticks.ToString()))
+                            .Where(m => {
+                                // Skip system messages
+                                if (string.IsNullOrWhiteSpace(m.Text) || 
+                                    m.Text.Contains("joined the channel") ||
+                                    m.Text.Contains("LUNA Agent is online") ||
+                                    m.Text.Contains("has joined") ||
+                                    m.User == null)
+                                    return false;
+                                
+                                // Parse Slack timestamp (format: "1234567890.123456")
+                                if (double.TryParse(m.Timestamp.ToString("F6"), out var msgTimestamp))
+                                    return msgTimestamp > lastMessageTimestamp && 
+                                           !processedMessageTimestamps.Contains(m.Timestamp.ToString());
+                                return false;
+                            })
                             .OrderBy(m => m.Timestamp)
                             .ToList();
 
                         foreach (var message in newMessages)
                         {
-                            var messageTicks = message.Timestamp.Ticks;
-                            lastMessageTimestamp = messageTicks;
-                            processedMessageTimestamps.Add(messageTicks.ToString());
-
-                            // Convert to MessageEvent and handle
-                            if (message.User != null)
+                            try
                             {
-                                var messageEvent = new MessageEvent
-                                {
-                                    Channel = agentChannelId,
-                                    User = message.User,
-                                    Text = message.Text ?? "",
-                                    Type = "message"
-                                };
+                                var messageTimestampStr = message.Timestamp.ToString("F6");
+                                if (double.TryParse(messageTimestampStr, out var ts))
+                                    lastMessageTimestamp = ts;
+                                
+                                processedMessageTimestamps.Add(messageTimestampStr);
 
-                                await HandleSlackMessage(messageEvent, client);
+                                // Convert to MessageEvent and handle
+                                if (message.User != null && !string.IsNullOrWhiteSpace(message.Text))
+                                {
+                                    var messageEvent = new MessageEvent
+                                    {
+                                        Channel = agentChannelId,
+                                        User = message.User,
+                                        Text = message.Text,
+                                        Type = "message"
+                                    };
+
+                                    await HandleSlackMessage(messageEvent, client);
+                                }
+                            }
+                            catch (Exception msgEx)
+                            {
+                                Console.WriteLine($"⚠️  Error processing message: {msgEx.Message}");
                             }
                         }
                     }
