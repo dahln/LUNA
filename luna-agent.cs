@@ -1230,8 +1230,8 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                         await SendSlackMessage(slack, $"📦 Working with repository: {classification.UrlOfExternalGitHubRepo}");
                         await LogThought(task.Id, iteration, ThoughtType.UserUpdate, $"Processing repo: {classification.UrlOfExternalGitHubRepo}");
                         
-                        var repoPath = Path.Combine("/tmp", $"luna-repo-{task.Id}");
-                        var repoAccessible = await CloneOrPullRepo(classification.UrlOfExternalGitHubRepo, repoPath, task.Id);
+                            await SendSlackMessage(slack, "⚠️ Could not create repository, but the task is complete. Files have been saved locally on the agent host.");
+                            await LogThought(task.Id, iteration, ThoughtType.UserUpdate, "Files saved locally on the agent host; repository creation failed.");
                         
                         if (!repoAccessible)
                         {
