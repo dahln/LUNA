@@ -1,6 +1,6 @@
-# 🌙 L.U.N.A. Master Deployment Blueprint
+# 🌙 Local-Univeral-Neural-Agent (L.U.N.A.)
 
-LUNA stands for: Local-Univeral-Neural-Agent
+**⚠️⚠️⚠️This project is in a very early stage of development. It is only partially functional and will change/evolve.⚠️⚠️⚠️**
 
 ## Project Description
 
