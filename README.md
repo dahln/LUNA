@@ -416,7 +416,7 @@ Environment=PATH=/home/luna/.dotnet:/usr/local/sbin:/usr/local/bin:/usr/sbin:/us
 Environment=HOME=/home/luna
 
 # Load LUNA configuration from user home directory
-EnvironmentFile=%h/.luna/luna.env
+EnvironmentFile=/home/luna/.luna/luna.env
 
 # Start the agent
 ExecStart=/home/luna/.dotnet/dotnet screen.cs
