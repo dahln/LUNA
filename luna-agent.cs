@@ -488,41 +488,109 @@ async Task CleanupStaleContainers()
 // Task Deliverables Management
 // ============================================================================
 
-bool IsCodeRelatedTask(string description)
+async Task<TaskClassification> ClassifyTaskWithAI(string description, int taskId)
 {
-    // Detect if task is code-related by looking for keywords
-    var lowerDesc = description.ToLower();
-    var codeKeywords = new[] { 
-        "code", "script", "program", "function", "class", "api", "app", "application",
-        "python", "javascript", "java", "c#", "csharp", "go", "rust", "node", "react",
-        "repo", "repository", "git", "github", "pull request", "pr", "commit",
-        "install", "package", "npm", "pip", "cargo", "build", "compile", "debug",
-        "website", "web", "server", "database", "sql"
-    };
-    
-    return codeKeywords.Any(keyword => lowerDesc.Contains(keyword));
-}
-
-string? ExtractRepoReference(string description)
-{
-    // Try to find GitHub repo references in the task description
-    // Patterns: github.com/owner/repo, owner/repo, or full URLs
-    var patterns = new[] {
-        @"github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)",
-        @"(?:^|\s)([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)(?:\s|$)",
-        @"https?://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)"
-    };
-    
-    foreach (var pattern in patterns)
+    try
     {
-        var match = System.Text.RegularExpressions.Regex.Match(description, pattern);
-        if (match.Success)
+        await LogToDb(taskId, "Classifying task using AI...");
+        
+        var prompt = $@"Analyze this task description and determine its classification.
+
+Task: {description}
+
+Respond with ONLY valid JSON (no markdown code blocks):
+{{
+  ""isCodeTask"": true or false,
+  ""requiresNewRepo"": true or false,
+  ""requiresExternalRepoAccess"": true or false,
+  ""urlOfExternalGitHubRepo"": ""url or null""
+}}
+
+Guidelines:
+- isCodeTask: true if the task involves writing, modifying, or working with code/scripts/programs
+- requiresNewRepo: true if it's a code task that doesn't reference an existing repository
+- requiresExternalRepoAccess: true if the task references an existing GitHub repository
+- urlOfExternalGitHubRepo: extract the GitHub repo URL if mentioned (formats: github.com/owner/repo, owner/repo, or full URL), otherwise null
+
+Examples:
+""Write a Python script to calculate primes"" -> isCodeTask: true, requiresNewRepo: true, requiresExternalRepoAccess: false, urlOfExternalGitHubRepo: null
+""Create an analysis of market trends"" -> isCodeTask: false, requiresNewRepo: false, requiresExternalRepoAccess: false, urlOfExternalGitHubRepo: null
+""Fix the bug in dahln/LUNA repository"" -> isCodeTask: true, requiresNewRepo: false, requiresExternalRepoAccess: true, urlOfExternalGitHubRepo: ""dahln/LUNA""
+
+Respond with ONLY the JSON object, no other text:";
+
+        var aiResponse = await CallOllama(prompt);
+        await LogToDb(taskId, $"AI classification response: {aiResponse}");
+        
+        // Clean up markdown code blocks if present
+        var cleanedResponse = aiResponse.Trim();
+        if (cleanedResponse.StartsWith("```json"))
+            cleanedResponse = cleanedResponse.Substring(7).TrimStart();
+        else if (cleanedResponse.StartsWith("```"))
+            cleanedResponse = cleanedResponse.Substring(3).TrimStart();
+        
+        if (cleanedResponse.EndsWith("```"))
+            cleanedResponse = cleanedResponse.Substring(0, cleanedResponse.Length - 3).TrimEnd();
+        
+        cleanedResponse = cleanedResponse.Trim();
+        
+        var classification = JsonDocument.Parse(cleanedResponse);
+        var root = classification.RootElement;
+        
+        var result = new TaskClassification
         {
-            return match.Groups[1].Value;
-        }
+            IsCodeTask = root.GetProperty("isCodeTask").GetBoolean(),
+            RequiresNewRepo = root.GetProperty("requiresNewRepo").GetBoolean(),
+            RequiresExternalRepoAccess = root.GetProperty("requiresExternalRepoAccess").GetBoolean(),
+            UrlOfExternalGitHubRepo = root.TryGetProperty("urlOfExternalGitHubRepo", out var urlProp) && urlProp.ValueKind != JsonValueKind.Null
+                ? urlProp.GetString()
+                : null
+        };
+        
+        await LogToDb(taskId, $"Classification: IsCode={result.IsCodeTask}, NewRepo={result.RequiresNewRepo}, ExternalRepo={result.RequiresExternalRepoAccess}, URL={result.UrlOfExternalGitHubRepo}");
+        
+        return result;
     }
-    
-    return null;
+    catch (Exception ex)
+    {
+        await LogToDb(taskId, $"Error classifying task with AI: {ex.Message}. Falling back to keyword detection.");
+        
+        // Fallback to keyword-based detection
+        var lowerDesc = description.ToLower();
+        var codeKeywords = new[] { 
+            "code", "script", "program", "function", "class", "api", "app", "application",
+            "python", "javascript", "java", "c#", "csharp", "go", "rust", "node", "react",
+            "repo", "repository", "git", "github", "pull request", "pr", "commit"
+        };
+        
+        var isCodeTask = codeKeywords.Any(keyword => lowerDesc.Contains(keyword));
+        
+        // Try to extract repo reference with regex as fallback
+        string? repoUrl = null;
+        var patterns = new[] {
+            @"github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)",
+            @"(?:^|\s)([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)(?:\s|$)",
+            @"https?://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)"
+        };
+        
+        foreach (var pattern in patterns)
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(description, pattern);
+            if (match.Success)
+            {
+                repoUrl = match.Groups[1].Value;
+                break;
+            }
+        }
+        
+        return new TaskClassification
+        {
+            IsCodeTask = isCodeTask,
+            RequiresNewRepo = isCodeTask && repoUrl == null,
+            RequiresExternalRepoAccess = repoUrl != null,
+            UrlOfExternalGitHubRepo = repoUrl
+        };
+    }
 }
 
 async Task<bool> CloneOrPullRepo(string repoReference, string targetPath, int taskId)
@@ -1144,10 +1212,10 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
             }
             else
             {
-                // Determine task type
-                var isCodeTask = IsCodeRelatedTask(task.Description);
+                // Use AI to classify the task
+                var classification = await ClassifyTaskWithAI(task.Description, task.Id);
                 
-                if (!isCodeTask)
+                if (!classification.IsCodeTask)
                 {
                     // Non-coding task: deliver results via Slack and cleanup
                     await LogThought(task.Id, iteration, ThoughtType.UserUpdate, "Delivering non-coding task results");
@@ -1156,23 +1224,21 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                 else
                 {
                     // Coding task: check for repo reference
-                    var repoReference = ExtractRepoReference(task.Description);
-                    
-                    if (!string.IsNullOrEmpty(repoReference))
+                    if (classification.RequiresExternalRepoAccess && !string.IsNullOrEmpty(classification.UrlOfExternalGitHubRepo))
                     {
                         // Existing repo referenced - clone/pull and create PR
-                        await SendSlackMessage(slack, $"📦 Working with repository: {repoReference}");
-                        await LogThought(task.Id, iteration, ThoughtType.UserUpdate, $"Processing repo: {repoReference}");
+                        await SendSlackMessage(slack, $"📦 Working with repository: {classification.UrlOfExternalGitHubRepo}");
+                        await LogThought(task.Id, iteration, ThoughtType.UserUpdate, $"Processing repo: {classification.UrlOfExternalGitHubRepo}");
                         
                         var repoPath = Path.Combine("/tmp", $"luna-repo-{task.Id}");
-                        var repoAccessible = await CloneOrPullRepo(repoReference, repoPath, task.Id);
+                        var repoAccessible = await CloneOrPullRepo(classification.UrlOfExternalGitHubRepo, repoPath, task.Id);
                         
                         if (!repoAccessible)
                         {
                             // Cannot access repo - mark task as failed
-                            await UpdateTaskStatus(task.Id, TaskStatus.Failed, errorMessage: $"Unable to access repository: {repoReference}");
-                            await SendSlackMessage(slack, $"❌ Task #{task.Id} failed: Cannot access repository {repoReference}. Please grant the agent access to this repository.");
-                            await LogThought(task.Id, iteration, ThoughtType.Error, $"Cannot access repo: {repoReference}");
+                            await UpdateTaskStatus(task.Id, TaskStatus.Failed, errorMessage: $"Unable to access repository: {classification.UrlOfExternalGitHubRepo}");
+                            await SendSlackMessage(slack, $"❌ Task #{task.Id} failed: Cannot access repository {classification.UrlOfExternalGitHubRepo}. Please grant the agent access to this repository.");
+                            await LogThought(task.Id, iteration, ThoughtType.Error, $"Cannot access repo: {classification.UrlOfExternalGitHubRepo}");
                             
                             // Cleanup
                             Directory.Delete(taskFolder, true);
@@ -1861,4 +1927,12 @@ public class AgentDbContext : DbContext
             .HasForeignKey(th => th.TaskId)
             .OnDelete(DeleteBehavior.Cascade);
     }
+}
+
+public class TaskClassification
+{
+    public bool IsCodeTask { get; set; }
+    public bool RequiresNewRepo { get; set; }
+    public bool RequiresExternalRepoAccess { get; set; }
+    public string? UrlOfExternalGitHubRepo { get; set; }
 }
