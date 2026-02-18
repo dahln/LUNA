@@ -753,8 +753,8 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
         var text = message.Text?.Trim() ?? "";
         Console.WriteLine($"Received message: {text}");
 
-        // Parse commands
-        if (text.StartsWith("/status"))
+        // Parse commands (use ! prefix since Slack intercepts / as slash commands)
+        if (text.StartsWith("!status"))
         {
             using var db = new AgentDbContext();
             var statusMsg = "📊 **LUNA Agent Status**\n\n";
@@ -784,7 +784,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
 
             await SendSlackMessage(slack, statusMsg);
         }
-        else if (text.StartsWith("/details"))
+        else if (text.StartsWith("!details"))
         {
             var parts = text.Split(' ', 2);
             if (parts.Length == 2 && int.TryParse(parts[1], out var taskId))
@@ -825,7 +825,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
                 }
             }
         }
-        else if (text.StartsWith("/pause"))
+        else if (text.StartsWith("!pause"))
         {
             var parts = text.Split(' ', 2);
             if (parts.Length == 2 && int.TryParse(parts[1], out var taskId))
@@ -843,7 +843,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
                 }
             }
         }
-        else if (text.StartsWith("/start"))
+        else if (text.StartsWith("!start"))
         {
             var parts = text.Split(' ', 2);
             if (parts.Length == 2 && int.TryParse(parts[1], out var taskId))
@@ -897,7 +897,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
                 }
             }
         }
-        else if (text.StartsWith("/stop"))
+        else if (text.StartsWith("!stop"))
         {
             var parts = text.Split(' ', 2);
             if (parts.Length == 2 && int.TryParse(parts[1], out var taskId))
@@ -906,7 +906,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
                 await SendSlackMessage(slack, $"🛑 Task #{taskId} stopped");
             }
         }
-        else if (text.StartsWith("/queue"))
+        else if (text.StartsWith("!queue"))
         {
             using var db = new AgentDbContext();
             var queuedTasks = db.Tasks
@@ -922,7 +922,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
 
             await SendSlackMessage(slack, msg.Length > 0 ? msg : "Queue is empty");
         }
-        else if (text.StartsWith("/help"))
+        else if (text.StartsWith("!help"))
         {
             var helpMsg = @"🤖 **LUNA Agent Commands**
 

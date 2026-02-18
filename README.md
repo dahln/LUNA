@@ -484,14 +484,16 @@ sudo journalctl -u luna -f
 Once the service is running, interact with the agent via Slack in the `#agent` channel:
 
 **Available Commands:**
-- `/status` - Show current task and queue status
-- `/details <task_id>` - Get detailed information about a specific task
-- `/queue` - List all queued and paused tasks
-- `/pause <task_id>` - Pause a queued task
-- `/start <task_id>` - Start a task (pauses current task if running, starts or resumes specified task)
-- `/stop <task_id>` - Stop a running or queued task
-- `/system` - Get current system status (CPU, RAM, temperature, Ollama)
-- `/help` - Display help message with all commands
+
+Send these commands as regular messages in the `#agent` channel (use `!` prefix instead of `/` since Slack intercepts slash commands):
+
+- `!status` - Show current task and queue status
+- `!details <task_id>` - Get detailed information about a specific task
+- `!queue` - List all queued and paused tasks
+- `!pause <task_id>` - Pause a queued task
+- `!start <task_id>` - Start a task (pauses current task if running, starts or resumes specified task)
+- `!stop <task_id>` - Stop a running or queued task
+- `!help` - Display help message with all commands
 
 **Creating Tasks:**
 Simply send a message in the `#agent` channel describing what you want the agent to do:
