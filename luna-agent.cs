@@ -679,27 +679,69 @@ async Task DeliverNonCodingTask(int taskId, string taskFolder, ISlackApiClient s
         
         await SendSlackMessage(slack, $"📦 Delivering results for task #{taskId}...");
         
+        var failedUploads = new List<string>();
+        
         foreach (var file in files)
         {
             var fileInfo = new FileInfo(file);
             var relativePath = Path.GetRelativePath(taskFolder, file);
             
-            // For text files, send content directly
-            if (fileInfo.Extension.ToLower() is ".txt" or ".md" or ".json" or ".csv" or ".log")
+            // For text files, send content directly if small enough, otherwise try to upload
+            if (fileInfo.Extension.ToLower() is ".txt" or ".md" or ".json" or ".csv" or ".log" or ".html" or ".xml" or ".yaml" or ".yml")
             {
                 var content = await System.IO.File.ReadAllTextAsync(file);
-                var truncated = content.Length > 3000 ? content[..3000] + "\n\n... (truncated)" : content;
-                await SendSlackMessage(slack, $"📄 **{relativePath}**\n```\n{truncated}\n```");
+                
+                // If content is small enough, send inline
+                if (content.Length <= 3000)
+                {
+                    await SendSlackMessage(slack, $"📄 **{relativePath}**\n```\n{content}\n```");
+                }
+                else
+                {
+                    // Try to upload as file to Slack
+                    var uploaded = await TryUploadFileToSlack(slack, file, relativePath, taskId);
+                    if (!uploaded)
+                    {
+                        failedUploads.Add(relativePath);
+                    }
+                }
             }
             else
             {
-                // For binary files, inform user about the file
-                await SendSlackMessage(slack, $"📎 Binary file created: {relativePath} (size: {fileInfo.Length} bytes)");
-                await LogToDb(taskId, $"Binary file: {relativePath}");
+                // For binary files, try to upload to Slack
+                var uploaded = await TryUploadFileToSlack(slack, file, relativePath, taskId);
+                if (!uploaded)
+                {
+                    failedUploads.Add(relativePath);
+                }
             }
         }
         
-        await SendSlackMessage(slack, $"✅ All deliverables for task #{taskId} have been sent");
+        // If any files failed to upload, create a GitHub repo
+        if (failedUploads.Count > 0)
+        {
+            await SendSlackMessage(slack, $"⚠️ Some files could not be delivered via Slack. Creating a GitHub repository...");
+            await LogToDb(taskId, $"Failed to upload {failedUploads.Count} files to Slack, creating GitHub repo");
+            
+            var repoUrl = await CreateRepoForDeliverables(taskId, taskFolder, slack);
+            
+            if (!string.IsNullOrEmpty(repoUrl))
+            {
+                await SendSlackMessage(slack, $"✅ Files delivered via GitHub repository: {repoUrl}");
+                if (!string.IsNullOrEmpty(userGithubName))
+                {
+                    await SendSlackMessage(slack, $"👤 User {userGithubName} has been added as a collaborator");
+                }
+            }
+            else
+            {
+                await SendSlackMessage(slack, $"❌ Could not deliver files - please check the agent logs");
+            }
+        }
+        else
+        {
+            await SendSlackMessage(slack, $"✅ All deliverables for task #{taskId} have been sent");
+        }
         
         // Clean up the task folder
         Directory.Delete(taskFolder, true);
@@ -708,6 +750,142 @@ async Task DeliverNonCodingTask(int taskId, string taskFolder, ISlackApiClient s
     catch (Exception ex)
     {
         await LogToDb(taskId, $"Error delivering non-coding task: {ex.Message}");
+    }
+}
+
+async Task<bool> TryUploadFileToSlack(ISlackApiClient slack, string filePath, string fileName, int taskId)
+{
+    try
+    {
+        await LogToDb(taskId, $"Attempting to upload file to Slack: {fileName}");
+        
+        var fileBytes = await System.IO.File.ReadAllBytesAsync(filePath);
+        using var fileStream = new MemoryStream(fileBytes);
+        
+        // Use positional parameters for the Upload method
+        var uploadResponse = await slack.Files.Upload(
+            fileStream,           // Stream content
+            fileName,            // filename
+            null,                // filetype
+            null,                // title (we'll set it separately if possible)
+            null,                // initialComment
+            null,                // threadTs
+            new[] { agentChannelId }  // channels
+        );
+        
+        if (uploadResponse != null && uploadResponse.File != null)
+        {
+            await SendSlackMessage(slack, $"📎 Uploaded: {fileName}");
+            await LogToDb(taskId, $"Successfully uploaded {fileName} to Slack");
+            return true;
+        }
+        
+        return false;
+    }
+    catch (Exception ex)
+    {
+        await LogToDb(taskId, $"Failed to upload {fileName} to Slack: {ex.Message}");
+        return false;
+    }
+}
+
+async Task<string?> CreateRepoForDeliverables(int taskId, string taskFolder, ISlackApiClient slack)
+{
+    try
+    {
+        var sanitized = $"deliverables-{DateTime.UtcNow:yyyyMMdd-HHmmss}";
+        var repoName = $"luna-task-{taskId}-{sanitized}".ToLower();
+        
+        // Validate repo name
+        if (!System.Text.RegularExpressions.Regex.IsMatch(repoName, @"^[a-z0-9-]+$"))
+        {
+            await LogToDb(taskId, $"Invalid repository name generated: {repoName}");
+            repoName = $"luna-task-{taskId}";
+        }
+        
+        // Check if GH_TOKEN is available
+        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN");
+        if (string.IsNullOrEmpty(ghToken))
+        {
+            await LogToDb(taskId, "GH_TOKEN not available - cannot create repository");
+            return null;
+        }
+        
+        // Create repo
+        await LogToDb(taskId, $"Creating GitHub repository for deliverables: {repoName}");
+        var output = await RunCommand($"gh repo create {repoName} --private --confirm");
+        
+        if (output.Contains("error") || output.Contains("failed"))
+        {
+            await LogToDb(taskId, $"Failed to create repository: {output}");
+            return null;
+        }
+        
+        // Clone the repo
+        var repoPath = Path.Combine("/tmp", $"luna-deliverables-{taskId}");
+        var repoUrlOutput = await RunCommand($"gh repo view {repoName} --json sshUrl --jq .sshUrl");
+        var repoUrl = repoUrlOutput.Trim();
+        
+        if (string.IsNullOrEmpty(repoUrl) || repoUrl.Contains("error"))
+        {
+            await LogToDb(taskId, "Could not get repository URL");
+            return null;
+        }
+        
+        await RunCommand($"git clone {repoUrl} {repoPath}");
+        
+        // Copy all files from task folder to repo
+        foreach (var file in Directory.GetFiles(taskFolder, "*", SearchOption.AllDirectories))
+        {
+            var relativePath = Path.GetRelativePath(taskFolder, file);
+            var destPath = Path.Combine(repoPath, relativePath);
+            var destDir = Path.GetDirectoryName(destPath);
+            if (!string.IsNullOrEmpty(destDir))
+                Directory.CreateDirectory(destDir);
+            System.IO.File.Copy(file, destPath, true);
+        }
+        
+        // Commit and push
+        await RunCommand("git add .", repoPath);
+        var commitMessage = $"LUNA Agent - Task #{taskId} deliverables";
+        await RunCommand($"git commit -m \"{commitMessage}\"", repoPath);
+        
+        var defaultBranch = await RunCommand("git symbolic-ref --short HEAD", repoPath);
+        defaultBranch = defaultBranch.Trim();
+        if (string.IsNullOrWhiteSpace(defaultBranch))
+            defaultBranch = "main";
+        
+        await RunCommand($"git push origin {defaultBranch}", repoPath);
+        
+        // Add user as collaborator if configured
+        if (!string.IsNullOrEmpty(userGithubName))
+        {
+            if (System.Text.RegularExpressions.Regex.IsMatch(userGithubName, @"^[a-zA-Z0-9-]+$"))
+            {
+                var currentUserOutput = await RunCommand("gh api user --jq .login");
+                var currentUser = currentUserOutput.Trim();
+                
+                if (!string.IsNullOrEmpty(currentUser) && !currentUser.Contains("error"))
+                {
+                    await RunCommand($"gh api repos/{currentUser}/{repoName}/collaborators/{userGithubName} -X PUT -f permission=push");
+                }
+            }
+        }
+        
+        // Get web URL
+        var webUrlOutput = await RunCommand($"gh repo view {repoName} --json url --jq .url");
+        var webUrl = webUrlOutput.Trim();
+        
+        // Cleanup temp repo
+        if (Directory.Exists(repoPath))
+            Directory.Delete(repoPath, true);
+        
+        return webUrl;
+    }
+    catch (Exception ex)
+    {
+        await LogToDb(taskId, $"Error creating repository for deliverables: {ex.Message}");
+        return null;
     }
 }
 
