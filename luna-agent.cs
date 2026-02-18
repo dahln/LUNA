@@ -49,6 +49,11 @@ const int MaxContextHistoryEntryLength = 5000;
 const int MaxErrorMessagePreviewLength = 2000;
 const int MaxIterationTimeSeconds = 180; // 3 minutes per iteration
 const int MaxOllamaRetries = 3; // Number of retries for Ollama failures
+const int OllamaRetryBaseDelayMs = 2000; // Base delay for retry exponential backoff
+
+// Markdown cleanup constants
+const string MarkdownJsonBlockPrefix = "```json";
+const string MarkdownCodeBlockPrefix = "```";
 
 // Load Slack tokens from file
 if (System.IO.File.Exists(slackConfigFile))
@@ -206,7 +211,7 @@ async Task<string> CallOllama(string prompt, string? model = null, int retryCoun
                 if (retryCount < MaxOllamaRetries)
                 {
                     Console.WriteLine($"   Retrying... (attempt {retryCount + 1}/{MaxOllamaRetries})");
-                    await Task.Delay(2000 * (retryCount + 1)); // Exponential backoff
+                    await Task.Delay(OllamaRetryBaseDelayMs * (retryCount + 1)); // Exponential backoff
                     return await CallOllama(prompt, model, retryCount + 1);
                 }
                 return "";
@@ -224,7 +229,7 @@ async Task<string> CallOllama(string prompt, string? model = null, int retryCoun
                 if (retryCount < MaxOllamaRetries)
                 {
                     Console.WriteLine($"   Retrying... (attempt {retryCount + 1}/{MaxOllamaRetries})");
-                    await Task.Delay(2000 * (retryCount + 1)); // Exponential backoff
+                    await Task.Delay(OllamaRetryBaseDelayMs * (retryCount + 1)); // Exponential backoff
                     return await CallOllama(prompt, model, retryCount + 1);
                 }
                 return "";
@@ -236,7 +241,7 @@ async Task<string> CallOllama(string prompt, string? model = null, int retryCoun
             if (retryCount < MaxOllamaRetries)
             {
                 Console.WriteLine($"   Retrying... (attempt {retryCount + 1}/{MaxOllamaRetries})");
-                await Task.Delay(2000 * (retryCount + 1)); // Exponential backoff
+                await Task.Delay(OllamaRetryBaseDelayMs * (retryCount + 1)); // Exponential backoff
                 return await CallOllama(prompt, model, retryCount + 1);
             }
         }
@@ -247,7 +252,7 @@ async Task<string> CallOllama(string prompt, string? model = null, int retryCoun
         if (retryCount < MaxOllamaRetries)
         {
             Console.WriteLine($"   Retrying... (attempt {retryCount + 1}/{MaxOllamaRetries})");
-            await Task.Delay(2000 * (retryCount + 1)); // Exponential backoff
+            await Task.Delay(OllamaRetryBaseDelayMs * (retryCount + 1)); // Exponential backoff
             return await CallOllama(prompt, model, retryCount + 1);
         }
     }
@@ -1108,16 +1113,14 @@ Respond with ONLY a JSON array of step descriptions (no markdown, no code blocks
             {
                 // Clean up markdown if present
                 var cleanedPlan = planResponse.Trim();
-                const string jsonBlockPrefix = "```json";
-                const string codeBlockPrefix = "```";
                 
-                if (cleanedPlan.StartsWith(jsonBlockPrefix)) 
-                    cleanedPlan = cleanedPlan.Substring(jsonBlockPrefix.Length).TrimStart();
-                else if (cleanedPlan.StartsWith(codeBlockPrefix)) 
-                    cleanedPlan = cleanedPlan.Substring(codeBlockPrefix.Length).TrimStart();
+                if (cleanedPlan.StartsWith(MarkdownJsonBlockPrefix)) 
+                    cleanedPlan = cleanedPlan.Substring(MarkdownJsonBlockPrefix.Length).TrimStart();
+                else if (cleanedPlan.StartsWith(MarkdownCodeBlockPrefix)) 
+                    cleanedPlan = cleanedPlan.Substring(MarkdownCodeBlockPrefix.Length).TrimStart();
                 
-                if (cleanedPlan.EndsWith(codeBlockPrefix)) 
-                    cleanedPlan = cleanedPlan.Substring(0, cleanedPlan.Length - codeBlockPrefix.Length).TrimEnd();
+                if (cleanedPlan.EndsWith(MarkdownCodeBlockPrefix)) 
+                    cleanedPlan = cleanedPlan.Substring(0, cleanedPlan.Length - MarkdownCodeBlockPrefix.Length).TrimEnd();
                 
                 var planArray = JsonDocument.Parse(cleanedPlan).RootElement;
                 var planSteps = new StringBuilder("📋 **Execution Plan:**\n");
@@ -1183,6 +1186,17 @@ Respond with ONLY a JSON array of step descriptions (no markdown, no code blocks
             await SendSlackMessage(slack, iterationMsg);
             await LogToDb(task.Id, $"Iteration {iteration} started");
             await LogThought(task.Id, iteration, ThoughtType.Observation, $"Starting iteration {iteration}");
+            
+            // Check iteration timeout before AI call
+            var iterationElapsed = (DateTime.UtcNow - iterationStartTime).TotalSeconds;
+            if (iterationElapsed > MaxIterationTimeSeconds)
+            {
+                await SendSlackMessage(slack, $"⏱️ Iteration {iteration} reached time limit ({MaxIterationTimeSeconds}s) before AI call. Progress recorded, continuing in next iteration...");
+                await LogThought(task.Id, iteration, ThoughtType.Observation, $"Iteration reached time limit before AI call. Elapsed: {iterationElapsed:F0}s");
+                contextHistory.AppendLine($"[Iteration {iteration}] Time limit reached ({iterationElapsed:F0}s) before AI call. Continuing in next iteration.");
+                await Task.Delay(2000);
+                continue;
+            }
 
             // Build context-aware prompt with history from previous iterations
             var prompt = $@"You are LUNA, an AI agent running in an isolated Docker container. Current task: {task.Description}
@@ -1237,21 +1251,6 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                 await Task.Delay(5000);
                 continue;
             }
-            
-            // Reset failure count on successful response
-            ollamaFailureCount = 0;
-
-            // Check iteration timeout (3 minutes)
-            var iterationElapsed = (DateTime.UtcNow - iterationStartTime).TotalSeconds;
-            if (iterationElapsed > MaxIterationTimeSeconds)
-            {
-                await SendSlackMessage(slack, $"⏱️ Iteration {iteration} reached time limit ({MaxIterationTimeSeconds}s). Progress recorded, continuing in next iteration...");
-                await LogThought(task.Id, iteration, ThoughtType.Observation, $"Iteration reached time limit. Elapsed: {iterationElapsed:F0}s");
-                contextHistory.AppendLine($"[Iteration {iteration}] Time limit reached ({iterationElapsed:F0}s). Continuing with fresh context in next iteration.");
-                // Continue to next iteration with a fresh start
-                await Task.Delay(2000);
-                continue;
-            }
 
             // Strip markdown code blocks if present (common AI wrapping pattern)
             var cleanedResponse = aiResponse.Trim();
@@ -1279,6 +1278,9 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
             {
                 var actionDoc = JsonDocument.Parse(cleanedResponse);
                 var action = actionDoc.RootElement.GetProperty("action").GetString();
+                
+                // Reset failure count only after successful parse
+                ollamaFailureCount = 0;
 
                 if (action == "complete" || aiResponse.Contains("TASK_COMPLETE"))
                 {
