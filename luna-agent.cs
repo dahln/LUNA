@@ -44,6 +44,8 @@ const int MaxTaskIterations = 100;
 const int MaxSlackMessagePreviewLength = 500;
 const int MaxDescriptionPreviewLength = 50;
 const int MaxLogPreviewLength = 2000;
+const int MaxContextHistoryEntryLength = 500;
+const int MaxErrorMessagePreviewLength = 200;
 
 // Load Slack tokens from file
 if (System.IO.File.Exists(slackConfigFile))
@@ -631,18 +633,21 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
 
             // Strip markdown code blocks if present (common AI wrapping pattern)
             var cleanedResponse = aiResponse.Trim();
+            
+            // Remove opening markdown block
             if (cleanedResponse.StartsWith("```json"))
             {
-                cleanedResponse = cleanedResponse.Substring(7); // Remove ```json
+                cleanedResponse = cleanedResponse.Substring(7).TrimStart(); // Remove ```json and any leading whitespace/newlines
             }
             else if (cleanedResponse.StartsWith("```"))
             {
-                cleanedResponse = cleanedResponse.Substring(3); // Remove ```
+                cleanedResponse = cleanedResponse.Substring(3).TrimStart(); // Remove ``` and any leading whitespace/newlines
             }
             
-            if (cleanedResponse.EndsWith("```"))
+            // Remove closing markdown block
+            if (cleanedResponse.EndsWith("```") && cleanedResponse.Length >= 3)
             {
-                cleanedResponse = cleanedResponse.Substring(0, cleanedResponse.Length - 3);
+                cleanedResponse = cleanedResponse.Substring(0, cleanedResponse.Length - 3).TrimEnd();
             }
             
             cleanedResponse = cleanedResponse.Trim();
@@ -692,7 +697,7 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                     
                     // Add to context history for next iteration
                     contextHistory.AppendLine($"[Iteration {iteration}] Executed: {command}");
-                    contextHistory.AppendLine($"Output: {commandOutput.Substring(0, Math.Min(500, commandOutput.Length))}");
+                    contextHistory.AppendLine($"Output: {commandOutput.Substring(0, Math.Min(MaxContextHistoryEntryLength, commandOutput.Length))}");
                 }
                 else if (action == "create_file")
                 {
@@ -734,12 +739,12 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                     
                     // Add to context history
                     contextHistory.AppendLine($"[Iteration {iteration}] Research: {details}");
-                    contextHistory.AppendLine($"Results: {researchResult.Substring(0, Math.Min(500, researchResult.Length))}");
+                    contextHistory.AppendLine($"Results: {researchResult.Substring(0, Math.Min(MaxContextHistoryEntryLength, researchResult.Length))}");
                 }
             }
             catch (Exception ex)
             {
-                var errorMsg = $"Error parsing AI response: {ex.Message}. Raw response: {cleanedResponse.Substring(0, Math.Min(200, cleanedResponse.Length))}";
+                var errorMsg = $"Error parsing AI response: {ex.Message}. Raw response: {cleanedResponse.Substring(0, Math.Min(MaxErrorMessagePreviewLength, cleanedResponse.Length))}";
                 await LogToDb(task.Id, errorMsg);
                 await LogThought(task.Id, iteration, ThoughtType.Error, $"Error: {ex.Message}");
                 await SendSlackMessage(slack, $"⚠️ Error processing AI response: {ex.Message}");
@@ -985,7 +990,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
                     task.Description += $"\n\nUser Update: {updateText}";
                     await db.SaveChangesAsync();
                     
-                    // Log the update
+                    // Log the update (iteration 0 indicates user action outside iteration loop)
                     await LogToDb(taskId, $"User update: {updateText}");
                     await LogThought(taskId, 0, ThoughtType.UserUpdate, $"User provided update: {updateText}");
                     
