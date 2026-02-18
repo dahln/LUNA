@@ -292,7 +292,7 @@ Create a new app at https://api.slack.com/apps -> From Manifest:
       "bot_user": { "display_name": "LUNA", "always_online": true }
    },
    "oauth_config": {
-      "scopes": { "bot": ["chat:write", "im:history", "app_mentions:read", "files:write"] }
+      "scopes": { "bot": ["chat:write", "im:history", "app_mentions:read", "files:write", "channels:history"] }
    },
    "settings": { "socket_mode_enabled": true }
 }
@@ -437,8 +437,8 @@ CPUQuota=25%
 # All task execution happens inside isolated Docker containers
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
+ProtectSystem=off
+ProtectHome=no
 ReadWritePaths=/home/luna/luna
 ReadWritePaths=/home/luna/.local/share/dotnet
 ReadWritePaths=/home/luna/.nuget
