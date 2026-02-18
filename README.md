@@ -257,10 +257,11 @@ ssh -T git@github.com
 
 ### Create GitHub Personal Access Token (PAT)
 
-The LUNA Agent uses a Personal Access Token (PAT) to create pull requests. The token is stored in your `.env` file and used by the agent automatically.
+The LUNA Agent uses a Personal Access Token (PAT) to create pull requests, create new repositories, and manage collaborators. The token is stored in your `.env` file and used by the agent automatically.
 
 - In GitHub (as `ailunamachine`), go to Settings > Developer settings > Personal access tokens > Tokens (classic) and generate a new token.
 - Give it a name like "LUNA Agent Token" and enable scopes: `repo`, `workflow`.
+- The `repo` scope includes permissions for managing collaborators on repositories.
 - Copy the token (it starts with `ghp_`) and keep it secure.
 - You will add this token to `~/.luna/luna.env` as `GH_TOKEN=ghp_...`
 
@@ -341,7 +342,10 @@ SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 SLACK_CHANNEL_ID=C01234567
 GH_TOKEN=ghp_...
+UserGithubName=your-github-username
 ```
+
+**Important:** The `UserGithubName` should be set to your personal GitHub username. The agent will add this user as a collaborator when creating new repositories for coding tasks.
 
 The systemd service will load this file from your home directory.
 
@@ -418,6 +422,7 @@ Environment="SLACK_BOT_TOKEN=$(grep ^SLACK_BOT_TOKEN /home/luna/.luna/luna.env |
 Environment="SLACK_APP_TOKEN=$(grep ^SLACK_APP_TOKEN /home/luna/.luna/luna.env | cut -d= -f2)"
 Environment="SLACK_CHANNEL_ID=$(grep ^SLACK_CHANNEL_ID /home/luna/.luna/luna.env | cut -d= -f2)"
 Environment="GH_TOKEN=$(grep ^GH_TOKEN /home/luna/.luna/luna.env | cut -d= -f2)"
+Environment="UserGithubName=$(grep ^UserGithubName /home/luna/.luna/luna.env | cut -d= -f2)"
 
 # Start the agent
 ExecStart=/home/luna/.dotnet/dotnet luna-agent.cs

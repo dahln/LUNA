@@ -33,6 +33,7 @@ var slackBotToken = "";
 var slackAppToken = "";
 var agentChannelId = "";
 var agentUserId = "";
+var userGithubName = "";
 
 // AI Configuration
 const double OllamaTemperature = 0.7;
@@ -61,6 +62,7 @@ if (System.IO.File.Exists(slackConfigFile))
             if (key == "SLACK_BOT_TOKEN" || key == "xoxb") slackBotToken = value;
             if (key == "SLACK_APP_TOKEN" || key == "xapp") slackAppToken = value;
             if (key == "SLACK_CHANNEL_ID") agentChannelId = value;
+            if (key == "UserGithubName") userGithubName = value;
         }
     }
 }
@@ -346,51 +348,6 @@ async Task<string> CopyFileFromContainer(string containerId, string containerPat
     return await RunCommand($"docker cp {containerId}:{containerPath} {localPath}");
 }
 
-async Task<(string? branchName, string? repoPath)> CreateGitBranch(int taskId, string taskDescription)
-{
-    try
-    {
-        var sanitized = new string(taskDescription.Take(30).Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray());
-        var branchName = $"luna-task-{taskId}-{sanitized}".ToLower();
-        var repoPath = Path.Combine("/tmp", $"luna-repo-{taskId}");
-
-        // Check if we're in a git repo or need to create a new one
-        var gitConfigOutput = await RunCommand("git config --get remote.origin.url");
-        
-        if (string.IsNullOrEmpty(gitConfigOutput) || gitConfigOutput.Contains("Error"))
-        {
-            // Create a new repository
-            Directory.CreateDirectory(repoPath);
-            await RunCommand("git init", repoPath);
-            await RunCommand("git config user.name 'LUNA Agent'", repoPath);
-            await RunCommand("git config user.email 'luna-agent@localhost'", repoPath);
-            
-            // Try to get GitHub username from SSH config
-            var githubUser = await RunCommand("git config --get user.name || echo 'luna-agent'");
-            githubUser = githubUser.Trim();
-            
-            await LogToDb(taskId, $"Created new repository at {repoPath}");
-        }
-        else
-        {
-            // Use existing repository
-            var currentDir = Directory.GetCurrentDirectory();
-            repoPath = currentDir;
-        }
-
-        // Create and checkout branch
-        await RunCommand($"git checkout -b {branchName}", repoPath);
-        await LogToDb(taskId, $"Created branch: {branchName}");
-
-        return (branchName, repoPath);
-    }
-    catch (Exception ex)
-    {
-        await LogToDb(taskId, $"Error creating branch: {ex.Message}");
-        return (null, null);
-    }
-}
-
 async Task<string?> CreatePullRequest(int taskId, string branchName, string repoPath, string taskDescription)
 {
     try
@@ -524,6 +481,548 @@ async Task CleanupStaleContainers()
     catch (Exception ex)
     {
         Console.WriteLine($"Warning: Error during container cleanup: {ex.Message}");
+    }
+}
+
+// ============================================================================
+// Task Deliverables Management
+// ============================================================================
+
+async Task<TaskClassification> ClassifyTaskWithAI(string description, int taskId)
+{
+    try
+    {
+        await LogToDb(taskId, "Classifying task using AI...");
+        
+        var prompt = $@"Analyze this task description and determine its classification.
+
+Task: {description}
+
+Respond with ONLY valid JSON (no markdown code blocks):
+{{
+  ""isCodeTask"": true or false,
+  ""requiresNewRepo"": true or false,
+  ""requiresExternalRepoAccess"": true or false,
+  ""urlOfExternalGitHubRepo"": ""url or null""
+}}
+
+Guidelines:
+- isCodeTask: true if the task involves writing, modifying, or working with code/scripts/programs
+- requiresNewRepo: true if it's a code task that doesn't reference an existing repository
+- requiresExternalRepoAccess: true if the task references an existing GitHub repository
+- urlOfExternalGitHubRepo: extract the GitHub repo URL if mentioned (formats: github.com/owner/repo, owner/repo, or full URL), otherwise null
+
+Examples:
+""Write a Python script to calculate primes"" -> isCodeTask: true, requiresNewRepo: true, requiresExternalRepoAccess: false, urlOfExternalGitHubRepo: null
+""Create an analysis of market trends"" -> isCodeTask: false, requiresNewRepo: false, requiresExternalRepoAccess: false, urlOfExternalGitHubRepo: null
+""Fix the bug in dahln/LUNA repository"" -> isCodeTask: true, requiresNewRepo: false, requiresExternalRepoAccess: true, urlOfExternalGitHubRepo: ""dahln/LUNA""
+
+Respond with ONLY the JSON object, no other text:";
+
+        var aiResponse = await CallOllama(prompt);
+        await LogToDb(taskId, $"AI classification response: {aiResponse}");
+        
+        // Clean up markdown code blocks if present
+        var cleanedResponse = aiResponse.Trim();
+        if (cleanedResponse.StartsWith("```json"))
+            cleanedResponse = cleanedResponse.Substring(7).TrimStart();
+        else if (cleanedResponse.StartsWith("```"))
+            cleanedResponse = cleanedResponse.Substring(3).TrimStart();
+        
+        if (cleanedResponse.EndsWith("```"))
+            cleanedResponse = cleanedResponse.Substring(0, cleanedResponse.Length - 3).TrimEnd();
+        
+        cleanedResponse = cleanedResponse.Trim();
+        
+        var classification = JsonDocument.Parse(cleanedResponse);
+        var root = classification.RootElement;
+        
+        var result = new TaskClassification
+        {
+            IsCodeTask = root.GetProperty("isCodeTask").GetBoolean(),
+            RequiresNewRepo = root.GetProperty("requiresNewRepo").GetBoolean(),
+            RequiresExternalRepoAccess = root.GetProperty("requiresExternalRepoAccess").GetBoolean(),
+            UrlOfExternalGitHubRepo = root.TryGetProperty("urlOfExternalGitHubRepo", out var urlProp) && urlProp.ValueKind != JsonValueKind.Null
+                ? urlProp.GetString()
+                : null
+        };
+        
+        await LogToDb(taskId, $"Classification: IsCode={result.IsCodeTask}, NewRepo={result.RequiresNewRepo}, ExternalRepo={result.RequiresExternalRepoAccess}, URL={result.UrlOfExternalGitHubRepo}");
+        
+        return result;
+    }
+    catch (Exception ex)
+    {
+        await LogToDb(taskId, $"Error classifying task with AI: {ex.Message}. Falling back to keyword detection.");
+        
+        // Fallback to keyword-based detection
+        var lowerDesc = description.ToLower();
+        var codeKeywords = new[] { 
+            "code", "script", "program", "function", "class", "api", "app", "application",
+            "python", "javascript", "java", "c#", "csharp", "go", "rust", "node", "react",
+            "repo", "repository", "git", "github", "pull request", "pr", "commit"
+        };
+        
+        var isCodeTask = codeKeywords.Any(keyword => lowerDesc.Contains(keyword));
+        
+        // Try to extract repo reference with regex as fallback
+        string? repoUrl = null;
+        var patterns = new[] {
+            @"github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)",
+            @"(?:^|\s)([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)(?:\s|$)",
+            @"https?://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)"
+        };
+        
+        foreach (var pattern in patterns)
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(description, pattern);
+            if (match.Success)
+            {
+                repoUrl = match.Groups[1].Value;
+                break;
+            }
+        }
+        
+        return new TaskClassification
+        {
+            IsCodeTask = isCodeTask,
+            RequiresNewRepo = isCodeTask && repoUrl == null,
+            RequiresExternalRepoAccess = repoUrl != null,
+            UrlOfExternalGitHubRepo = repoUrl
+        };
+    }
+}
+
+async Task<bool> CloneOrPullRepo(string repoReference, string targetPath, int taskId)
+{
+    try
+    {
+        var repoUrl = repoReference.StartsWith("http") ? repoReference : $"https://github.com/{repoReference}";
+        
+        if (Directory.Exists(targetPath))
+        {
+            // Validate that it's actually a git repo and matches expected URL
+            var gitDirPath = Path.Combine(targetPath, ".git");
+            if (!Directory.Exists(gitDirPath))
+            {
+                await LogToDb(taskId, $"Directory {targetPath} exists but is not a git repo. Removing and cloning fresh.");
+                Directory.Delete(targetPath, true);
+                // Fall through to clone
+            }
+            else
+            {
+                // Verify remote URL matches
+                var remoteUrlOutput = await RunCommand("git config --get remote.origin.url", targetPath);
+                var existingUrl = remoteUrlOutput.Trim();
+                
+                if (!existingUrl.Contains(repoReference.Replace("https://github.com/", "")))
+                {
+                    await LogToDb(taskId, $"Directory {targetPath} has wrong remote URL. Removing and cloning fresh.");
+                    Directory.Delete(targetPath, true);
+                    // Fall through to clone
+                }
+                else
+                {
+                    // Repo already exists and is valid, pull latest
+                    await LogToDb(taskId, $"Pulling latest changes from {repoReference}");
+                    await RunCommand("git fetch origin", targetPath);
+                    
+                    // Determine the default branch
+                    var defaultBranch = await RunCommand("git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@'", targetPath);
+                    if (string.IsNullOrWhiteSpace(defaultBranch))
+                    {
+                        // Fallback: try to detect from remote branches
+                        defaultBranch = await RunCommand("git branch -r | grep -o 'origin/main\\|origin/master' | head -1 | sed 's@origin/@@'", targetPath);
+                    }
+                    defaultBranch = defaultBranch.Trim();
+                    if (string.IsNullOrWhiteSpace(defaultBranch))
+                        defaultBranch = "main"; // Final fallback
+                    
+                    var pullOutput = await RunCommand($"git pull origin {defaultBranch}", targetPath);
+                    if (pullOutput.Contains("fatal") || pullOutput.Contains("error"))
+                    {
+                        await LogToDb(taskId, $"Failed to pull from {defaultBranch}: {pullOutput}");
+                        return false;
+                    }
+                    return true;
+                }
+            }
+        }
+        
+        // Clone the repo (either first time or after cleanup)
+        if (!Directory.Exists(targetPath))
+        {
+            await LogToDb(taskId, $"Cloning repository {repoReference}");
+            var output = await RunCommand($"git clone {repoUrl} {targetPath}");
+            
+            if (output.Contains("fatal") || output.Contains("error"))
+            {
+                await LogToDb(taskId, $"Failed to clone repository: {output}");
+                return false;
+            }
+            
+            return true;
+        }
+        
+        return false;
+    }
+    catch (Exception ex)
+    {
+        await LogToDb(taskId, $"Error accessing repository: {ex.Message}");
+        return false;
+    }
+}
+
+async Task<string?> CreateNewGithubRepo(int taskId, string taskDescription, ISlackApiClient slack)
+{
+    try
+    {
+        var sanitized = new string(taskDescription.Take(30).Select(c => char.IsLetterOrDigit(c) || c == '-' ? c : '-').ToArray());
+        var repoName = $"luna-task-{taskId}-{sanitized}".ToLower();
+        
+        // Validate repo name matches GitHub requirements
+        if (!System.Text.RegularExpressions.Regex.IsMatch(repoName, @"^[a-z0-9-]+$"))
+        {
+            await LogToDb(taskId, $"Invalid repository name generated: {repoName}");
+            repoName = $"luna-task-{taskId}"; // Fallback to simple name
+        }
+        
+        // Check if GH_TOKEN is available
+        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN");
+        if (string.IsNullOrEmpty(ghToken))
+        {
+            await LogToDb(taskId, "GH_TOKEN not available - cannot create repository");
+            await SendSlackMessage(slack, $"⚠️ Cannot create new repository - GitHub token not configured");
+            return null;
+        }
+        
+        // Create repo using GitHub CLI
+        await LogToDb(taskId, $"Creating new GitHub repository: {repoName}");
+        var output = await RunCommand($"gh repo create {repoName} --private --confirm");
+        
+        if (output.Contains("error") || output.Contains("failed"))
+        {
+            await LogToDb(taskId, $"Failed to create repository: {output}");
+            return null;
+        }
+        
+        // Add user as collaborator if UserGithubName is configured
+        if (!string.IsNullOrEmpty(userGithubName))
+        {
+            // Validate GitHub username (alphanumeric and hyphens only)
+            if (!System.Text.RegularExpressions.Regex.IsMatch(userGithubName, @"^[a-zA-Z0-9-]+$"))
+            {
+                await LogToDb(taskId, $"Invalid GitHub username: {userGithubName}");
+                await SendSlackMessage(slack, $"⚠️ Invalid UserGithubName configured: {userGithubName}");
+            }
+            else
+            {
+                await LogToDb(taskId, $"Adding {userGithubName} as collaborator");
+                
+                // Get the current user's login first to avoid nested shell substitution
+                var currentUserOutput = await RunCommand("gh api user --jq .login");
+                var currentUser = currentUserOutput.Trim();
+                
+                if (string.IsNullOrEmpty(currentUser) || currentUser.Contains("error"))
+                {
+                    await LogToDb(taskId, $"Could not determine current GitHub user");
+                    await SendSlackMessage(slack, $"⚠️ Could not add collaborator - authentication issue");
+                }
+                else
+                {
+                    var addCollabOutput = await RunCommand($"gh api repos/{currentUser}/{repoName}/collaborators/{userGithubName} -X PUT -f permission=push");
+                    
+                    if (addCollabOutput.Contains("error") || addCollabOutput.Contains("Not Found"))
+                    {
+                        await LogToDb(taskId, $"Warning: Could not add {userGithubName} as collaborator: {addCollabOutput}");
+                        await SendSlackMessage(slack, $"⚠️ Could not add {userGithubName} as collaborator - please add manually");
+                    }
+                    else
+                    {
+                        await SendSlackMessage(slack, $"✅ Added {userGithubName} as collaborator to {repoName}");
+                    }
+                }
+            }
+        }
+        
+        // Get the repo URL
+        var repoUrlOutput = await RunCommand($"gh repo view {repoName} --json url --jq .url");
+        var repoUrl = repoUrlOutput.Trim();
+        
+        await LogToDb(taskId, $"Created repository: {repoUrl}");
+        return repoUrl;
+    }
+    catch (Exception ex)
+    {
+        await LogToDb(taskId, $"Error creating repository: {ex.Message}");
+        return null;
+    }
+}
+
+async Task DeliverNonCodingTask(int taskId, string taskFolder, ISlackApiClient slack)
+{
+    try
+    {
+        // Get all files from the task folder
+        var files = Directory.GetFiles(taskFolder, "*", SearchOption.AllDirectories);
+        
+        if (files.Length == 0)
+        {
+            await SendSlackMessage(slack, $"✅ Task #{taskId} completed - no deliverables to return");
+            return;
+        }
+        
+        await SendSlackMessage(slack, $"📦 Delivering results for task #{taskId}...");
+        
+        var failedUploads = new List<string>();
+        
+        foreach (var file in files)
+        {
+            var fileInfo = new FileInfo(file);
+            var relativePath = Path.GetRelativePath(taskFolder, file);
+            
+            // For text files, send content directly if small enough, otherwise try to upload
+            if (fileInfo.Extension.ToLower() is ".txt" or ".md" or ".json" or ".csv" or ".log" or ".html" or ".xml" or ".yaml" or ".yml")
+            {
+                var content = await System.IO.File.ReadAllTextAsync(file);
+                
+                // If content is small enough, send inline
+                if (content.Length <= 3000)
+                {
+                    await SendSlackMessage(slack, $"📄 **{relativePath}**\n```\n{content}\n```");
+                }
+                else
+                {
+                    // Try to upload as file to Slack
+                    var uploaded = await TryUploadFileToSlack(slack, file, relativePath, taskId);
+                    if (!uploaded)
+                    {
+                        failedUploads.Add(relativePath);
+                    }
+                }
+            }
+            else
+            {
+                // For binary files, try to upload to Slack
+                var uploaded = await TryUploadFileToSlack(slack, file, relativePath, taskId);
+                if (!uploaded)
+                {
+                    failedUploads.Add(relativePath);
+                }
+            }
+        }
+        
+        // If any files failed to upload, create a GitHub repo
+        if (failedUploads.Count > 0)
+        {
+            await SendSlackMessage(slack, $"⚠️ Some files could not be delivered via Slack. Creating a GitHub repository...");
+            await LogToDb(taskId, $"Failed to upload {failedUploads.Count} files to Slack, creating GitHub repo");
+            
+            var repoUrl = await CreateRepoForDeliverables(taskId, taskFolder, slack);
+            
+            if (!string.IsNullOrEmpty(repoUrl))
+            {
+                await SendSlackMessage(slack, $"✅ Files delivered via GitHub repository: {repoUrl}");
+                if (!string.IsNullOrEmpty(userGithubName))
+                {
+                    await SendSlackMessage(slack, $"👤 User {userGithubName} has been added as a collaborator");
+                }
+                // Clean up the task folder only after successful delivery
+                Directory.Delete(taskFolder, true);
+                await LogToDb(taskId, $"Cleaned up task folder: {taskFolder}");
+            }
+            else
+            {
+                await SendSlackMessage(slack, $"❌ Could not deliver files via Slack or GitHub. Files have been preserved on the agent host for manual retrieval.");
+                await LogToDb(taskId, $"Warning: Files preserved at {taskFolder} due to delivery failure");
+                // Do NOT delete taskFolder - keep files for manual retrieval
+            }
+        }
+        else
+        {
+            await SendSlackMessage(slack, $"✅ All deliverables for task #{taskId} have been sent");
+            // Clean up the task folder only after successful delivery
+            Directory.Delete(taskFolder, true);
+            await LogToDb(taskId, $"Cleaned up task folder: {taskFolder}");
+        }
+    }
+    catch (Exception ex)
+    {
+        await LogToDb(taskId, $"Error delivering non-coding task: {ex.Message}");
+    }
+}
+
+async Task<bool> TryUploadFileToSlack(ISlackApiClient slack, string filePath, string fileName, int taskId)
+{
+    try
+    {
+        await LogToDb(taskId, $"Attempting to upload file to Slack: {fileName}");
+        
+        // Stream file directly from disk to avoid loading entire file into memory
+        using var fileStream = new System.IO.FileStream(
+            filePath,
+            System.IO.FileMode.Open,
+            System.IO.FileAccess.Read,
+            System.IO.FileShare.Read,
+            bufferSize: 4096,
+            useAsync: true
+        );
+        
+        // Use positional parameters for the Upload method
+        var uploadResponse = await slack.Files.Upload(
+            fileStream,           // Stream content
+            fileName,            // filename
+            null,                // filetype
+            null,                // title (we'll set it separately if possible)
+            null,                // initialComment
+            null,                // threadTs
+            new[] { agentChannelId }  // channels
+        );
+        
+        if (uploadResponse != null && uploadResponse.File != null)
+        {
+            await SendSlackMessage(slack, $"📎 Uploaded: {fileName}");
+            await LogToDb(taskId, $"Successfully uploaded {fileName} to Slack");
+            return true;
+        }
+        
+        return false;
+    }
+    catch (Exception ex)
+    {
+        await LogToDb(taskId, $"Failed to upload {fileName} to Slack: {ex.Message}");
+        return false;
+    }
+}
+
+async Task<string?> CreateRepoForDeliverables(int taskId, string taskFolder, ISlackApiClient slack)
+{
+    try
+    {
+        var sanitized = $"deliverables-{DateTime.UtcNow:yyyyMMdd-HHmmss}";
+        var repoName = $"luna-task-{taskId}-{sanitized}".ToLower();
+        
+        // Validate repo name
+        if (!System.Text.RegularExpressions.Regex.IsMatch(repoName, @"^[a-z0-9-]+$"))
+        {
+            await LogToDb(taskId, $"Invalid repository name generated: {repoName}");
+            repoName = $"luna-task-{taskId}";
+        }
+        
+        // Check if GH_TOKEN is available
+        var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN");
+        if (string.IsNullOrEmpty(ghToken))
+        {
+            await LogToDb(taskId, "GH_TOKEN not available - cannot create repository");
+            return null;
+        }
+        
+        // Create repo
+        await LogToDb(taskId, $"Creating GitHub repository for deliverables: {repoName}");
+        var output = await RunCommand($"gh repo create {repoName} --private --confirm");
+        
+        if (output.Contains("error") || output.Contains("failed"))
+        {
+            await LogToDb(taskId, $"Failed to create repository: {output}");
+            return null;
+        }
+        
+        // Clone the repo
+        var repoPath = Path.Combine("/tmp", $"luna-deliverables-{taskId}");
+        var repoUrlOutput = await RunCommand($"gh repo view {repoName} --json sshUrl --jq .sshUrl");
+        var repoUrl = repoUrlOutput.Trim();
+        
+        if (string.IsNullOrEmpty(repoUrl) || repoUrl.Contains("error"))
+        {
+            await LogToDb(taskId, "Could not get repository URL");
+            return null;
+        }
+        
+        var cloneOutput = await RunCommand($"git clone {repoUrl} {repoPath}");
+        var gitDirPath = Path.Combine(repoPath, ".git");
+        
+        // Validate that clone succeeded
+        if (cloneOutput.Contains("error", StringComparison.OrdinalIgnoreCase) ||
+            cloneOutput.Contains("failed", StringComparison.OrdinalIgnoreCase) ||
+            cloneOutput.Contains("fatal", StringComparison.OrdinalIgnoreCase) ||
+            !Directory.Exists(gitDirPath))
+        {
+            await LogToDb(taskId, $"Failed to clone repository to {repoPath}: {cloneOutput}");
+            return null;
+        }
+        
+        // Copy all files from task folder to repo
+        foreach (var file in Directory.GetFiles(taskFolder, "*", SearchOption.AllDirectories))
+        {
+            var relativePath = Path.GetRelativePath(taskFolder, file);
+            var destPath = Path.Combine(repoPath, relativePath);
+            var destDir = Path.GetDirectoryName(destPath);
+            if (!string.IsNullOrEmpty(destDir))
+                Directory.CreateDirectory(destDir);
+            System.IO.File.Copy(file, destPath, true);
+        }
+        
+        // Configure git identity for commits
+        await RunCommand("git config user.name \"LUNA Agent\"", repoPath);
+        await RunCommand("git config user.email \"luna-agent@localhost\"", repoPath);
+        
+        // Commit and push
+        await RunCommand("git add .", repoPath);
+        var commitMessage = $"LUNA Agent - Task #{taskId} deliverables";
+        var commitOutput = await RunCommand($"git commit -m \"{commitMessage}\"", repoPath);
+        
+        // Check for commit errors
+        if (commitOutput.Contains("nothing to commit", StringComparison.OrdinalIgnoreCase) ||
+            commitOutput.Contains("no changes added to commit", StringComparison.OrdinalIgnoreCase))
+        {
+            await LogToDb(taskId, $"Git commit failed: no changes to commit");
+            return null;
+        }
+        
+        var defaultBranch = await RunCommand("git symbolic-ref --short HEAD", repoPath);
+        defaultBranch = defaultBranch.Trim();
+        if (string.IsNullOrWhiteSpace(defaultBranch))
+            defaultBranch = "main";
+        
+        var pushOutput = await RunCommand($"git push origin {defaultBranch}", repoPath);
+        
+        // Check for push errors
+        if (pushOutput.Contains("error", StringComparison.OrdinalIgnoreCase) ||
+            pushOutput.Contains("fatal", StringComparison.OrdinalIgnoreCase))
+        {
+            await LogToDb(taskId, $"Git push failed: {pushOutput}");
+            return null;
+        }
+        
+        // Add user as collaborator if configured
+        if (!string.IsNullOrEmpty(userGithubName))
+        {
+            if (System.Text.RegularExpressions.Regex.IsMatch(userGithubName, @"^[a-zA-Z0-9-]+$"))
+            {
+                var currentUserOutput = await RunCommand("gh api user --jq .login");
+                var currentUser = currentUserOutput.Trim();
+                
+                if (!string.IsNullOrEmpty(currentUser) && !currentUser.Contains("error"))
+                {
+                    await RunCommand($"gh api repos/{currentUser}/{repoName}/collaborators/{userGithubName} -X PUT -f permission=push");
+                }
+            }
+        }
+        
+        // Get web URL
+        var webUrlOutput = await RunCommand($"gh repo view {repoName} --json url --jq .url");
+        var webUrl = webUrlOutput.Trim();
+        
+        // Cleanup temp repo
+        if (Directory.Exists(repoPath))
+            Directory.Delete(repoPath, true);
+        
+        return webUrl;
+    }
+    catch (Exception ex)
+    {
+        await LogToDb(taskId, $"Error creating repository for deliverables: {ex.Message}");
+        return null;
     }
 }
 
@@ -760,47 +1259,201 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
             await Task.Delay(2000); // Rate limiting
         }
 
-        // If task involves code/files and is completed, copy from container and create branch/PR
+        // If task is completed, handle deliverables based on task type
         if (completed)
         {
-            // Copy files from container to local temp directory
-            var localWorkingDir = Path.Combine("/tmp", $"luna-task-{task.Id}");
-            Directory.CreateDirectory(localWorkingDir);
-            await CopyFileFromContainer(containerId!, "/workspace/.", localWorkingDir);
+            // Create task-specific folder in home directory (sibling to luna execution directory)
+            var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var taskFolder = Path.Combine(homeDir, $"luna-task-{task.Id}");
+            Directory.CreateDirectory(taskFolder);
             
-            if (Directory.GetFiles(localWorkingDir, "*", SearchOption.AllDirectories).Length > 0)
+            // Copy files from container to task folder
+            await LogToDb(task.Id, $"Copying deliverables to {taskFolder}");
+            await CopyFileFromContainer(containerId!, "/workspace/.", taskFolder);
+            
+            var hasFiles = Directory.GetFiles(taskFolder, "*", SearchOption.AllDirectories).Length > 0;
+            
+            if (!hasFiles)
             {
-                await SendSlackMessage(slack, $"📦 Creating branch and PR for task #{task.Id}...");
-                await LogThought(task.Id, iteration, ThoughtType.UserUpdate, "Creating branch and PR");
-                var (branchName, repoPath) = await CreateGitBranch(task.Id, task.Description);
-            
-                if (!string.IsNullOrEmpty(branchName) && !string.IsNullOrEmpty(repoPath))
+                // No files created, just mark complete
+                await SendSlackMessage(slack, $"✅ Task #{task.Id} completed with no deliverables");
+                Directory.Delete(taskFolder, true);
+            }
+            else
+            {
+                // Use AI to classify the task
+                var classification = await ClassifyTaskWithAI(task.Description, task.Id);
+                
+                if (!classification.IsCodeTask)
                 {
-                    // Copy files from local working directory to repo
-                    foreach (var file in Directory.GetFiles(localWorkingDir, "*", SearchOption.AllDirectories))
+                    // Non-coding task: deliver results via Slack and cleanup
+                    await LogThought(task.Id, iteration, ThoughtType.UserUpdate, "Delivering non-coding task results");
+                    await DeliverNonCodingTask(task.Id, taskFolder, slack);
+                }
+                else
+                {
+                    // Coding task: check for repo reference
+                    if (classification.RequiresExternalRepoAccess && !string.IsNullOrEmpty(classification.UrlOfExternalGitHubRepo))
                     {
-                        var relativePath = Path.GetRelativePath(localWorkingDir, file);
-                        var destPath = Path.Combine(repoPath, relativePath);
-                        var destDir = Path.GetDirectoryName(destPath);
-                        if (!string.IsNullOrEmpty(destDir))
-                            Directory.CreateDirectory(destDir);
-                        System.IO.File.Copy(file, destPath, true);
-                    }
-
-                    var prUrl = await CreatePullRequest(task.Id, branchName, repoPath, task.Description);
-                    
-                    if (!string.IsNullOrEmpty(prUrl))
-                    {
-                        using var db = new AgentDbContext();
-                        var dbTask = await db.Tasks.FindAsync(task.Id);
-                        if (dbTask != null)
+                        // Existing repo referenced - clone/pull and create PR
+                        await SendSlackMessage(slack, $"📦 Working with repository: {classification.UrlOfExternalGitHubRepo}");
+                        await LogThought(task.Id, iteration, ThoughtType.UserUpdate, $"Processing repo: {classification.UrlOfExternalGitHubRepo}");
+                        
+                        var repoPath = Path.Combine("/tmp", $"luna-repo-{task.Id}");
+                        var repoAccessible = await CloneOrPullRepo(classification.UrlOfExternalGitHubRepo, repoPath, task.Id);
+                        
+                        if (!repoAccessible)
                         {
-                            dbTask.BranchName = branchName;
-                            dbTask.PullRequestUrl = prUrl;
-                            await db.SaveChangesAsync();
+                            // Cannot access repo - mark task as failed
+                            await UpdateTaskStatus(task.Id, TaskStatus.Failed, errorMessage: $"Unable to access repository: {classification.UrlOfExternalGitHubRepo}");
+                            await SendSlackMessage(slack, $"❌ Task #{task.Id} failed: Cannot access repository {classification.UrlOfExternalGitHubRepo}. Please grant the agent access to this repository.");
+                            await LogThought(task.Id, iteration, ThoughtType.Error, $"Cannot access repo: {classification.UrlOfExternalGitHubRepo}");
+                            
+                            // Cleanup
+                            Directory.Delete(taskFolder, true);
+                            if (Directory.Exists(repoPath))
+                                Directory.Delete(repoPath, true);
+                            
+                            return;
                         }
-                        await SendSlackMessage(slack, $"✅ Pull request created: {prUrl}");
-                        await LogThought(task.Id, iteration, ThoughtType.UserUpdate, $"PR created: {prUrl}");
+                        
+                        // Copy files from task folder to repo
+                        var sanitized = new string(task.Description.Take(30).Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray());
+                        var branchName = $"luna-task-{task.Id}-{sanitized}".ToLower();
+                        
+                        await RunCommand($"git checkout -b {branchName}", repoPath);
+                        
+                        foreach (var file in Directory.GetFiles(taskFolder, "*", SearchOption.AllDirectories))
+                        {
+                            var relativePath = Path.GetRelativePath(taskFolder, file);
+                            var destPath = Path.Combine(repoPath, relativePath);
+                            var destDir = Path.GetDirectoryName(destPath);
+                            if (!string.IsNullOrEmpty(destDir))
+                                Directory.CreateDirectory(destDir);
+                            System.IO.File.Copy(file, destPath, true);
+                        }
+                        
+                        // Create PR
+                        var prUrl = await CreatePullRequest(task.Id, branchName, repoPath, task.Description);
+                        
+                        if (!string.IsNullOrEmpty(prUrl))
+                        {
+                            using var db = new AgentDbContext();
+                            var dbTask = await db.Tasks.FindAsync(task.Id);
+                            if (dbTask != null)
+                            {
+                                dbTask.BranchName = branchName;
+                                dbTask.PullRequestUrl = prUrl;
+                                await db.SaveChangesAsync();
+                            }
+                            await SendSlackMessage(slack, $"✅ Pull request created: {prUrl}");
+                            await LogThought(task.Id, iteration, ThoughtType.UserUpdate, $"PR created: {prUrl}");
+                        }
+                        
+                        // Cleanup task folder and temp repo
+                        Directory.Delete(taskFolder, true);
+                        if (Directory.Exists(repoPath))
+                            Directory.Delete(repoPath, true);
+                    }
+                    else
+                    {
+                        // No repo referenced - create new repo and add user as collaborator
+                        await SendSlackMessage(slack, $"📦 Creating new repository for task #{task.Id}...");
+                        await LogThought(task.Id, iteration, ThoughtType.UserUpdate, "Creating new repository");
+                        
+                        var repoUrl = await CreateNewGithubRepo(task.Id, task.Description, slack);
+                        
+                        if (string.IsNullOrEmpty(repoUrl))
+                        {
+                            await SendSlackMessage(slack, $"⚠️ Could not create repository, but task is complete. Files saved on the agent host for manual retrieval.");
+                            await LogThought(task.Id, iteration, ThoughtType.UserUpdate, $"Files saved locally at {taskFolder}");
+                        }
+                        else
+                        {
+                            // Clone the newly created repo
+                            var repoPath = Path.Combine("/tmp", $"luna-repo-{task.Id}");
+                            var cloneOutput = await RunCommand($"git clone {repoUrl} {repoPath}");
+                            var gitDir = Path.Combine(repoPath, ".git");
+
+                            // Ensure clone succeeded before proceeding
+                            if (!Directory.Exists(gitDir) || cloneOutput.Contains("fatal") || cloneOutput.Contains("error"))
+                            {
+                                await LogToDb(task.Id, $"Warning: Failed to clone repository {repoUrl}: {cloneOutput}");
+                                await SendSlackMessage(slack, $"⚠️ Repository {repoUrl} was created, but the agent could not clone it. Files saved on the agent host for manual retrieval.");
+                                await LogThought(task.Id, iteration, ThoughtType.UserUpdate, $"Repository created but clone failed; files kept locally at {taskFolder}");
+                            }
+                            else
+                            {
+                                // Copy files to repo
+                                foreach (var file in Directory.GetFiles(taskFolder, "*", SearchOption.AllDirectories))
+                                {
+                                    var relativePath = Path.GetRelativePath(taskFolder, file);
+                                    var destPath = Path.Combine(repoPath, relativePath);
+                                    var destDir = Path.GetDirectoryName(destPath);
+                                    if (!string.IsNullOrEmpty(destDir))
+                                        Directory.CreateDirectory(destDir);
+                                    System.IO.File.Copy(file, destPath, true);
+                                }
+                                
+                                // Configure git identity
+                                await RunCommand("git config user.name \"LUNA Agent\"", repoPath);
+                                await RunCommand("git config user.email \"luna-agent@localhost\"", repoPath);
+                                
+                                // Commit and push to main
+                                await RunCommand("git add .", repoPath);
+                                var sanitizedDescription = task.Description[..Math.Min(MaxDescriptionPreviewLength, task.Description.Length)]
+                                    .Replace("\"", "\\\"")
+                                    .Replace("$", "\\$")
+                                    .Replace("`", "\\`")
+                                    .Replace("\n", " ")
+                                    .Replace("\r", "")
+                                    .Replace("\\", "\\\\");
+                                var commitMessage = $"LUNA Agent - Task #{task.Id}: {sanitizedDescription}";
+                                var commitOutput = await RunCommand($"git commit -m \"{commitMessage}\"", repoPath);
+                                
+                                // Check commit succeeded
+                                if (commitOutput.Contains("nothing to commit", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    await LogToDb(task.Id, "Warning: No changes to commit");
+                                }
+                                
+                                // Determine default branch and push
+                                var defaultBranch = await RunCommand("git symbolic-ref --short HEAD", repoPath);
+                                defaultBranch = defaultBranch.Trim();
+                                if (string.IsNullOrWhiteSpace(defaultBranch))
+                                    defaultBranch = "main";
+                                
+                                var pushOutput = await RunCommand($"git push origin {defaultBranch}", repoPath);
+                                if (pushOutput.Contains("fatal") || pushOutput.Contains("error"))
+                                {
+                                    await LogToDb(task.Id, $"Warning: Failed to push to {defaultBranch}: {pushOutput}");
+                                    await SendSlackMessage(slack, $"⚠️ Repository created but failed to push code. Repository: {repoUrl}");
+                                }
+                                else
+                                {
+                                    // Update task with repo URL
+                                    using var db = new AgentDbContext();
+                                    var dbTask = await db.Tasks.FindAsync(task.Id);
+                                    if (dbTask != null)
+                                    {
+                                        dbTask.PullRequestUrl = repoUrl;
+                                        await db.SaveChangesAsync();
+                                    }
+                                    
+                                    await SendSlackMessage(slack, $"✅ Repository created and code pushed: {repoUrl}");
+                                    if (!string.IsNullOrEmpty(userGithubName))
+                                    {
+                                        await SendSlackMessage(slack, $"👤 User {userGithubName} has been added as a collaborator");
+                                    }
+                                    await LogThought(task.Id, iteration, ThoughtType.UserUpdate, $"Repository created: {repoUrl}");
+                                }
+                                
+                                // Cleanup task folder and temp repo
+                                Directory.Delete(taskFolder, true);
+                                if (Directory.Exists(repoPath))
+                                    Directory.Delete(repoPath, true);
+                            }
+                        }
                     }
                 }
             }
@@ -1367,4 +2020,12 @@ public class AgentDbContext : DbContext
             .HasForeignKey(th => th.TaskId)
             .OnDelete(DeleteBehavior.Cascade);
     }
+}
+
+public class TaskClassification
+{
+    public bool IsCodeTask { get; set; }
+    public bool RequiresNewRepo { get; set; }
+    public bool RequiresExternalRepoAccess { get; set; }
+    public string? UrlOfExternalGitHubRepo { get; set; }
 }
