@@ -390,7 +390,10 @@ grep -E "SLACK_BOT_TOKEN|SLACK_APP_TOKEN|SLACK_CHANNEL_ID|GH_TOKEN" ~/.luna/luna
 
 **Note:** UFW firewall status was configured by root earlier and cannot be checked by the luna user (no sudo access needed).
 
-**Create the systemd service:**
+**Create the systemd service (as root):**
+
+⚠️ **Important:** The following steps require root access. Switch to a root terminal or have a root user perform these commands. Luna user cannot do this (and should not have sudo access).
+
 ```bash
 sudo nano /etc/systemd/system/luna.service
 ```
@@ -456,7 +459,8 @@ SyslogIdentifier=luna
 WantedBy=multi-user.target
 ```
 
-**Activate the service:**
+**Activate the service (as root):**
+
 ```bash
 # Reload systemd to recognize the new service
 sudo systemctl daemon-reload
@@ -470,7 +474,7 @@ sudo systemctl start luna
 # Check service status
 sudo systemctl status luna
 
-# View live logs
+# View live logs (you can run this as luna or root)
 sudo journalctl -u luna -f
 ```
 
