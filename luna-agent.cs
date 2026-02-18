@@ -582,8 +582,15 @@ async Task<string?> CreateNewGithubRepo(int taskId, string taskDescription, ISla
 {
     try
     {
-        var sanitized = new string(taskDescription.Take(30).Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray());
+        var sanitized = new string(taskDescription.Take(30).Select(c => char.IsLetterOrDigit(c) || c == '-' ? c : '-').ToArray());
         var repoName = $"luna-task-{taskId}-{sanitized}".ToLower();
+        
+        // Validate repo name matches GitHub requirements
+        if (!System.Text.RegularExpressions.Regex.IsMatch(repoName, @"^[a-z0-9-]+$"))
+        {
+            await LogToDb(taskId, $"Invalid repository name generated: {repoName}");
+            repoName = $"luna-task-{taskId}"; // Fallback to simple name
+        }
         
         // Check if GH_TOKEN is available
         var ghToken = Environment.GetEnvironmentVariable("GH_TOKEN");
@@ -607,17 +614,26 @@ async Task<string?> CreateNewGithubRepo(int taskId, string taskDescription, ISla
         // Add user as collaborator if UserGithubName is configured
         if (!string.IsNullOrEmpty(userGithubName))
         {
-            await LogToDb(taskId, $"Adding {userGithubName} as collaborator");
-            var addCollabOutput = await RunCommand($"gh api repos/$(gh api user --jq .login)/{repoName}/collaborators/{userGithubName} -X PUT -f permission=push");
-            
-            if (addCollabOutput.Contains("error") || addCollabOutput.Contains("Not Found"))
+            // Validate GitHub username (alphanumeric and hyphens only)
+            if (!System.Text.RegularExpressions.Regex.IsMatch(userGithubName, @"^[a-zA-Z0-9-]+$"))
             {
-                await LogToDb(taskId, $"Warning: Could not add {userGithubName} as collaborator: {addCollabOutput}");
-                await SendSlackMessage(slack, $"⚠️ Could not add {userGithubName} as collaborator - please add manually");
+                await LogToDb(taskId, $"Invalid GitHub username: {userGithubName}");
+                await SendSlackMessage(slack, $"⚠️ Invalid UserGithubName configured: {userGithubName}");
             }
             else
             {
-                await SendSlackMessage(slack, $"✅ Added {userGithubName} as collaborator to {repoName}");
+                await LogToDb(taskId, $"Adding {userGithubName} as collaborator");
+                var addCollabOutput = await RunCommand($"gh api repos/$(gh api user --jq .login)/{repoName}/collaborators/{userGithubName} -X PUT -f permission=push");
+                
+                if (addCollabOutput.Contains("error") || addCollabOutput.Contains("Not Found"))
+                {
+                    await LogToDb(taskId, $"Warning: Could not add {userGithubName} as collaborator: {addCollabOutput}");
+                    await SendSlackMessage(slack, $"⚠️ Could not add {userGithubName} as collaborator - please add manually");
+                }
+                else
+                {
+                    await SendSlackMessage(slack, $"✅ Added {userGithubName} as collaborator to {repoName}");
+                }
             }
         }
         
@@ -1045,8 +1061,7 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                             
                             // Commit and push to main
                             await RunCommand("git add .", repoPath);
-                            var sanitizedDescription = task.Description
-                                .Substring(0, Math.Min(MaxDescriptionPreviewLength, task.Description.Length))
+                            var sanitizedDescription = task.Description[..Math.Min(MaxDescriptionPreviewLength, task.Description.Length)]
                                 .Replace("\"", "\\\"")
                                 .Replace("$", "\\$")
                                 .Replace("`", "\\`");
