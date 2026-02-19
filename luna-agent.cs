@@ -104,9 +104,21 @@ using (var db = new AgentDbContext())
         await connection.OpenAsync();
         using var command = connection.CreateCommand();
         
-        // Check if UserPrompt column exists
-        command.CommandText = "SELECT COUNT(*) FROM pragma_table_info('Tasks') WHERE name='UserPrompt'";
-        var columnExists = (long)(await command.ExecuteScalarAsync() ?? 0L) > 0;
+        // Check if UserPrompt column exists using PRAGMA table_info
+        command.CommandText = "PRAGMA table_info(Tasks)";
+        using var reader = await command.ExecuteReaderAsync();
+        
+        var columnExists = false;
+        while (await reader.ReadAsync())
+        {
+            var columnName = reader.GetString(1); // Column name is at index 1
+            if (columnName.Equals("UserPrompt", StringComparison.OrdinalIgnoreCase))
+            {
+                columnExists = true;
+                break;
+            }
+        }
+        reader.Close();
         
         if (!columnExists)
         {
@@ -208,6 +220,14 @@ async Task SendSlackMessage(ISlackApiClient slack, string message)
     {
         Console.WriteLine($"Error sending Slack message: {ex.Message}");
     }
+}
+
+string FormatOutputWithTruncation(string output, int maxLength, string label = "Output", bool useCodeBlock = true)
+{
+    var preview = output.Substring(0, Math.Min(maxLength, output.Length));
+    var wasTruncated = output.Length > maxLength;
+    var formattedPreview = useCodeBlock ? $"```{preview}```" : preview;
+    return $"📤 **{label}:**\n{formattedPreview}{(wasTruncated ? $"\n_({label} truncated, full content saved in logs)_" : "")}";
 }
 
 string CleanMarkdownFromResponse(string response)
@@ -1334,9 +1354,7 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                     await LogThought(task.Id, iteration, ThoughtType.CommandOutput, commandOutput);
                     
                     // Show output preview with indication if truncated
-                    var outputPreview = commandOutput.Substring(0, Math.Min(MaxSlackMessagePreviewLength, commandOutput.Length));
-                    var wasTruncated = commandOutput.Length > MaxSlackMessagePreviewLength;
-                    await SendSlackMessage(slack, $"📤 **Output:**\n```{outputPreview}```{(wasTruncated ? "\n_(Output truncated, full output saved in logs)_" : "")}");
+                    await SendSlackMessage(slack, FormatOutputWithTruncation(commandOutput, MaxSlackMessagePreviewLength, "Output"));
                     
                     // Add to context history for next iteration
                     contextHistory.AppendLine($"[Iteration {iteration}] Executed: {command}");
@@ -1379,9 +1397,8 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                     await LogToDb(task.Id, $"Research results: {researchResult}");
                     await LogThought(task.Id, iteration, ThoughtType.Observation, researchResult);
                     
-                    var researchPreview = researchResult.Substring(0, Math.Min(MaxSlackMessagePreviewLength, researchResult.Length));
-                    var wasResearchTruncated = researchResult.Length > MaxSlackMessagePreviewLength;
-                    await SendSlackMessage(slack, $"📚 **Research Results:**\n{researchPreview}{(wasResearchTruncated ? "\n_(Results truncated, full results saved in logs)_" : "")}");
+                    // Format research results without code block (plain text is more readable)
+                    await SendSlackMessage(slack, FormatOutputWithTruncation(researchResult, MaxSlackMessagePreviewLength, "Research Results", useCodeBlock: false));
                     
                     // Add to context history
                     contextHistory.AppendLine($"[Iteration {iteration}] Research: {details}");
@@ -1847,9 +1864,14 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
                 var task = await db.Tasks.FindAsync(taskId);
                 if (task != null && task.Status == TaskStatus.Paused)
                 {
-                    // Store prompt response on task
+                    // Store prompt response on task (replaces any previous prompt)
                     task.UserPrompt = promptText;
-                    task.Description += $"\n\nUser Prompt Response: {promptText}";
+                    
+                    // Remove any previous prompt response from description and add new one
+                    var descLines = task.Description.Split('\n');
+                    var filteredDesc = string.Join('\n', descLines.Where(line => !line.StartsWith("User Prompt Response:")));
+                    task.Description = filteredDesc.TrimEnd() + $"\n\nUser Prompt Response: {promptText}";
+                    
                     await db.SaveChangesAsync();
                     
                     // Log the prompt
@@ -2283,7 +2305,7 @@ public class WorkTask
     public string Log { get; set; } = "";
     public string? ContainerId { get; set; }
     public string? ContainerName { get; set; }
-    public string? UserPrompt { get; set; }  // Stores prompt response for paused tasks
+    public string? UserPrompt { get; set; }  // Stores the most recent prompt response for paused tasks
     
     // Navigation property for full agentic flow
     public List<AgenticThought> Thoughts { get; set; } = new();
