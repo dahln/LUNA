@@ -2250,27 +2250,29 @@ Console.WriteLine($"Agent User ID: {agentUserId}");
 
 await SendSlackMessage(client, "🚀 LUNA Agent is online and ready!");
 
-// Load any previously queued or paused tasks from database into queue
-Console.WriteLine("Loading pending tasks from database...");
+// Load any previously queued tasks from database into queue
+// Note: Paused tasks are intentionally excluded - they were paused for a reason
+// and require explicit user action (e.g. !start <id>) to resume.
+Console.WriteLine("Loading queued tasks from database...");
 using (var db = new AgentDbContext())
 {
-    var pendingTasks = db.Tasks
-        .Where(t => t.Status == TaskStatus.Queued || t.Status == TaskStatus.Paused)
+    var queuedTasks = db.Tasks
+        .Where(t => t.Status == TaskStatus.Queued)
         .OrderBy(t => t.CreatedAt)
         .ToList();
     
     lock (queueLock)
     {
-        foreach (var task in pendingTasks)
+        foreach (var task in queuedTasks)
         {
             taskQueue.Enqueue(task);
         }
     }
     
-    if (pendingTasks.Count > 0)
+    if (queuedTasks.Count > 0)
     {
-        Console.WriteLine($"Loaded {pendingTasks.Count} pending tasks");
-        await SendSlackMessage(client, $"📋 Loaded {pendingTasks.Count} pending task(s) from previous session");
+        Console.WriteLine($"Loaded {queuedTasks.Count} queued tasks");
+        await SendSlackMessage(client, $"📋 Loaded {queuedTasks.Count} queued task(s) from previous session");
     }
 }
 
