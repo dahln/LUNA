@@ -128,6 +128,35 @@ sudo systemctl start ollama
 sudo systemctl status ollama
 ```
 
+**Configure Ollama Timeouts for Long-Running Tasks:**
+
+Ollama has server-side timeout settings that need to be adjusted for long-running AI tasks. By default, `OLLAMA_REQUEST_TIMEOUT` is only 30 seconds, which will cause timeouts during lengthy AI responses.
+
+```bash
+# Edit Ollama service configuration
+sudo systemctl edit ollama.service
+```
+
+Add the following under `[Service]`:
+
+```ini
+[Service]
+# Increase request timeout for long-running AI tasks (default: 30s)
+Environment="OLLAMA_REQUEST_TIMEOUT=3600s"
+
+# Keep models loaded in memory to avoid reload delays (optional)
+Environment="OLLAMA_KEEP_ALIVE=24h"
+```
+
+Then reload and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+```
+
+**Note:** The `OLLAMA_REQUEST_TIMEOUT` setting controls how long Ollama will process a single request before timing out. For long-running research tasks, set this to at least 3600s (1 hour). This works in conjunction with the `OLLAMA_TIMEOUT_MINUTES` setting in LUNA's configuration.
+
 ### Install and Configure UFW Firewall (as root):
 
 UFW provides essential firewall protections:
@@ -348,7 +377,7 @@ UserGithubName=your-github-username
 
 **Important:** 
 - The `UserGithubName` should be set to your personal GitHub username. The agent will add this user as a collaborator when creating new repositories for coding tasks.
-- The `OLLAMA_TIMEOUT_MINUTES` is optional and defaults to 30 minutes (maximum: 120 minutes). Increase this value if you experience timeout errors during long-running AI tasks that generate lengthy responses.
+- The `OLLAMA_TIMEOUT_MINUTES` is optional and defaults to 30 minutes (maximum: 120 minutes). This controls the HTTP client timeout for LUNA's requests to Ollama. **Note:** This must be coordinated with Ollama's own `OLLAMA_REQUEST_TIMEOUT` setting (see Ollama installation section) - both should be set to appropriate values for long-running tasks.
 
 The systemd service will load this file from your home directory.
 
