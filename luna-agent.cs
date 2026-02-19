@@ -1244,8 +1244,8 @@ For web research, you can use the 'research' action or directly use curl/wget co
 IMPORTANT: 
 - Respond with ONLY valid JSON. Do NOT wrap your response in markdown code blocks or backticks.
 - Do NOT ask follow-up questions - proceed with the task autonomously.
-- If the task is complete, use action "complete".
-- Only use action "need_input" if you CANNOT proceed without critical information from the user.
+- If the task is complete, use action ""complete"".
+- Only use action ""need_input"" if you CANNOT proceed without critical information from the user.
 
 {(contextHistory.Length > 0 ? $@"
 Previous iteration context:

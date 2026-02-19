@@ -29,9 +29,8 @@ jobs:
       run: |
         echo "Building luna-agent.cs..."
         dotnet build-server shutdown || true
-        # Just syntax check - don't execute
-        dotnet build luna-agent.cs --no-restore || true
-        echo "✓ luna-agent.cs syntax check complete"
+        dotnet build luna-agent.cs
+        echo "✓ luna-agent.cs build complete"
         
     - name: Build screen.cs
       run: |
