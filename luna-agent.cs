@@ -55,6 +55,12 @@ const int OllamaFailureDelayMs = 5000; // Delay after Ollama failure before retr
 const string MarkdownJsonBlockPrefix = "```json";
 const string MarkdownCodeBlockPrefix = "```";
 
+// Luna Research Repository
+const string LunaResearchRepoName = "luna-research";
+const int MaxSanitizedTitleLength = 60;
+const int MaxGitCommitMessageLength = 72;
+const int MaxPriorProjectsToDisplay = 20;
+
 // Load Slack tokens from file
 if (System.IO.File.Exists(slackConfigFile))
 {
@@ -99,6 +105,10 @@ using (var db = new AgentDbContext())
 // Clean up any stale containers from previous runs
 Console.WriteLine("🧹 Cleaning up stale Docker containers...");
 await CleanupStaleContainers();
+
+// Bootstrap luna-research repository on host
+Console.WriteLine("🔬 Bootstrapping luna-research repository...");
+await EnsureLunaResearchRepo();
 
 // ============================================================================
 // Task Queue Management
@@ -569,6 +579,181 @@ async Task CleanupStaleContainers()
 }
 
 // ============================================================================
+// Luna Research Repository (Host-Resident Persistent Memory)
+// ============================================================================
+
+string GetLunaResearchRepoPath()
+{
+    var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    return Path.Combine(homeDir, LunaResearchRepoName);
+}
+
+async Task<bool> EnsureLunaResearchRepo()
+{
+    try
+    {
+        var repoPath = GetLunaResearchRepoPath();
+        var gitDir = Path.Combine(repoPath, ".git");
+
+        if (Directory.Exists(gitDir))
+            return true;
+
+        // Create private GitHub repository (ignore error if it already exists remotely)
+        Console.WriteLine($"Creating private GitHub repository: {LunaResearchRepoName}");
+        await RunCommand($"gh repo create {LunaResearchRepoName} --private");
+
+        // Clone repo to host filesystem
+        if (Directory.Exists(repoPath))
+            Directory.Delete(repoPath, true);
+
+        var cloneOutput = await RunCommand($"gh repo clone {LunaResearchRepoName} {repoPath}");
+        Console.WriteLine($"Clone output: {cloneOutput}");
+
+        // If the repo was empty (no commits), initialize it manually
+        if (!Directory.Exists(gitDir))
+        {
+            Directory.CreateDirectory(repoPath);
+            await RunCommand("git init", repoPath);
+            var repoUrlOutput = await RunCommand($"gh repo view {LunaResearchRepoName} --json url --jq .url");
+            var sshUrlOutput = await RunCommand($"gh repo view {LunaResearchRepoName} --json sshUrl --jq .sshUrl");
+            var remoteUrl = sshUrlOutput.Trim();
+            if (string.IsNullOrEmpty(remoteUrl) || remoteUrl.Contains("error"))
+                remoteUrl = repoUrlOutput.Trim();
+            if (!string.IsNullOrEmpty(remoteUrl) && !remoteUrl.Contains("error"))
+                await RunCommand($"git remote add origin {remoteUrl}", repoPath);
+        }
+
+        // Configure git identity
+        await RunCommand("git config user.name \"LUNA Agent\"", repoPath);
+        await RunCommand("git config user.email \"luna-agent@localhost\"", repoPath);
+
+        // Ensure the repo has at least one commit (needed for pushes to work)
+        var readmePath = Path.Combine(repoPath, "README.md");
+        if (!System.IO.File.Exists(readmePath))
+        {
+            await System.IO.File.WriteAllTextAsync(readmePath,
+                "# LUNA Research Repository\n\nArchived research and essay projects from the L.U.N.A. agent.\n");
+            await RunCommand("git add .", repoPath);
+            var initCommit = await RunCommand("git commit -m \"Initialize luna-research repository\"", repoPath);
+            if (!initCommit.Contains("nothing to commit", StringComparison.OrdinalIgnoreCase))
+            {
+                await RunCommand("git branch -M main", repoPath);
+                await RunCommand("git push -u origin main", repoPath);
+            }
+        }
+
+        // Add user as collaborator
+        if (!string.IsNullOrEmpty(userGithubName) &&
+            System.Text.RegularExpressions.Regex.IsMatch(userGithubName, @"^[a-zA-Z0-9-]+$"))
+        {
+            Console.WriteLine($"Adding {userGithubName} as collaborator to {LunaResearchRepoName}");
+            await RunCommand($"gh repo add-collaborator {LunaResearchRepoName} {userGithubName} --permission push");
+        }
+
+        return Directory.Exists(gitDir);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Warning: Could not bootstrap luna-research repo: {ex.Message}");
+        return false;
+    }
+}
+
+async Task<string?> ArchiveToLunaResearch(int taskId, string taskTitle, string taskFolder)
+{
+    try
+    {
+        var repoPath = GetLunaResearchRepoPath();
+        var repoReady = await EnsureLunaResearchRepo();
+
+        if (!repoReady)
+        {
+            await LogToDb(taskId, "Could not access luna-research repo for archival");
+            return null;
+        }
+
+        // Configure git identity
+        await RunCommand("git config user.name \"LUNA Agent\"", repoPath);
+        await RunCommand("git config user.email \"luna-agent@localhost\"", repoPath);
+
+        // Pull latest to avoid conflicts
+        var defaultBranch = await RunCommand("git symbolic-ref --short HEAD", repoPath);
+        defaultBranch = defaultBranch.Trim();
+        if (string.IsNullOrWhiteSpace(defaultBranch))
+            defaultBranch = "main";
+        await RunCommand($"git pull --rebase origin {defaultBranch}", repoPath);
+
+        // Build archive directory path: archives/{sanitized-title}/{YYYY-MM-DD}/
+        var sanitizedTitle = new string(
+            taskTitle.Take(MaxSanitizedTitleLength)
+                     .Select(c => char.IsLetterOrDigit(c) || c == '-' || c == '_' || c == ' ' ? c : '-')
+                     .ToArray())
+            .Trim('-', ' ')
+            .Replace(' ', '-')
+            .ToLower();
+
+        var dateStr = DateTime.Now.ToString("yyyy-MM-dd");
+        var archiveRelativePath = Path.Combine("archives", sanitizedTitle, dateStr);
+        var archivePath = Path.Combine(repoPath, archiveRelativePath);
+        Directory.CreateDirectory(archivePath);
+
+        // Copy ALL files from task folder to archive (every file type, not just .md)
+        foreach (var file in Directory.GetFiles(taskFolder, "*", SearchOption.AllDirectories))
+        {
+            var relativePath = Path.GetRelativePath(taskFolder, file);
+            var destPath = Path.Combine(archivePath, relativePath);
+            var destDir = Path.GetDirectoryName(destPath);
+            if (!string.IsNullOrEmpty(destDir))
+                Directory.CreateDirectory(destDir);
+            System.IO.File.Copy(file, destPath, true);
+        }
+
+        await LogToDb(taskId, $"Copied files to luna-research: {archiveRelativePath}");
+
+        // Git add, commit, push from host
+        await RunCommand("git add .", repoPath);
+        var sanitizedCommitMsg = $"Archive task #{taskId}: {taskTitle}"
+            .Replace("\"", "'")
+            .Replace("\n", " ")
+            .Replace("\r", "");
+        sanitizedCommitMsg = sanitizedCommitMsg.Length > MaxGitCommitMessageLength
+            ? sanitizedCommitMsg.Substring(0, MaxGitCommitMessageLength)
+            : sanitizedCommitMsg;
+
+        var commitOutput = await RunCommand($"git commit -m \"{sanitizedCommitMsg}\"", repoPath);
+
+        if (!commitOutput.Contains("nothing to commit", StringComparison.OrdinalIgnoreCase) &&
+            !commitOutput.Contains("no changes added", StringComparison.OrdinalIgnoreCase))
+        {
+            var pushOutput = await RunCommand($"git push origin {defaultBranch}", repoPath);
+            if (pushOutput.Contains("error", StringComparison.OrdinalIgnoreCase) ||
+                pushOutput.Contains("fatal", StringComparison.OrdinalIgnoreCase))
+            {
+                await LogToDb(taskId, $"Warning: Failed to push to luna-research: {pushOutput}");
+            }
+            else
+            {
+                await LogToDb(taskId, $"Pushed archive to luna-research/{archiveRelativePath}");
+            }
+        }
+
+        // Construct folder URL
+        var repoUrlOutput = await RunCommand($"gh repo view {LunaResearchRepoName} --json url --jq .url");
+        var repoUrl = repoUrlOutput.Trim();
+        if (string.IsNullOrEmpty(repoUrl) || repoUrl.Contains("error"))
+            return null;
+
+        var archiveUrlPath = archiveRelativePath.Replace(Path.DirectorySeparatorChar, '/');
+        return $"{repoUrl}/tree/{defaultBranch}/{archiveUrlPath}";
+    }
+    catch (Exception ex)
+    {
+        await LogToDb(taskId, $"Error archiving to luna-research: {ex.Message}");
+        return null;
+    }
+}
+
+// ============================================================================
 // Task Deliverables Management
 // ============================================================================
 
@@ -834,91 +1019,36 @@ async Task<string?> CreateNewGithubRepo(int taskId, string taskDescription, ISla
     }
 }
 
-async Task DeliverNonCodingTask(int taskId, string taskFolder, ISlackApiClient slack)
+async Task DeliverNonCodingTask(int taskId, string taskTitle, string taskFolder, ISlackApiClient slack)
 {
     try
     {
-        // Get all files from the task folder
         var files = Directory.GetFiles(taskFolder, "*", SearchOption.AllDirectories);
-        
+
         if (files.Length == 0)
         {
-            await SendSlackMessage(slack, $"✅ Task #{taskId} completed - no deliverables to return");
+            await SendSlackMessage(slack, $"✅ Task #{taskId} completed - no deliverables to archive");
             return;
         }
-        
-        await SendSlackMessage(slack, $"📦 Delivering results for task #{taskId}...");
-        
-        var failedUploads = new List<string>();
-        
-        foreach (var file in files)
+
+        await SendSlackMessage(slack, $"📦 Archiving results for task #{taskId} to `{LunaResearchRepoName}` repository...");
+
+        var folderUrl = await ArchiveToLunaResearch(taskId, taskTitle, taskFolder);
+
+        if (!string.IsNullOrEmpty(folderUrl))
         {
-            var fileInfo = new FileInfo(file);
-            var relativePath = Path.GetRelativePath(taskFolder, file);
-            
-            // For text files, send content directly if small enough, otherwise try to upload
-            if (fileInfo.Extension.ToLower() is ".txt" or ".md" or ".json" or ".csv" or ".log" or ".html" or ".xml" or ".yaml" or ".yml")
+            await SendSlackMessage(slack, $"✅ Task #{taskId} completed!\n📁 Results archived to: {folderUrl}");
+            if (!string.IsNullOrEmpty(userGithubName))
             {
-                var content = await System.IO.File.ReadAllTextAsync(file);
-                
-                // If content is small enough, send inline
-                if (content.Length <= 3000)
-                {
-                    await SendSlackMessage(slack, $"📄 **{relativePath}**\n```\n{content}\n```");
-                }
-                else
-                {
-                    // Try to upload as file to Slack
-                    var uploaded = await TryUploadFileToSlack(slack, file, relativePath, taskId);
-                    if (!uploaded)
-                    {
-                        failedUploads.Add(relativePath);
-                    }
-                }
+                await SendSlackMessage(slack, $"👤 {userGithubName} has collaborator access to the `{LunaResearchRepoName}` repository");
             }
-            else
-            {
-                // For binary files, try to upload to Slack
-                var uploaded = await TryUploadFileToSlack(slack, file, relativePath, taskId);
-                if (!uploaded)
-                {
-                    failedUploads.Add(relativePath);
-                }
-            }
-        }
-        
-        // If any files failed to upload, create a GitHub repo
-        if (failedUploads.Count > 0)
-        {
-            await SendSlackMessage(slack, $"⚠️ Some files could not be delivered via Slack. Creating a GitHub repository...");
-            await LogToDb(taskId, $"Failed to upload {failedUploads.Count} files to Slack, creating GitHub repo");
-            
-            var repoUrl = await CreateRepoForDeliverables(taskId, taskFolder, slack);
-            
-            if (!string.IsNullOrEmpty(repoUrl))
-            {
-                await SendSlackMessage(slack, $"✅ Files delivered via GitHub repository: {repoUrl}");
-                if (!string.IsNullOrEmpty(userGithubName))
-                {
-                    await SendSlackMessage(slack, $"👤 User {userGithubName} has been added as a collaborator");
-                }
-                // Clean up the task folder only after successful delivery
-                Directory.Delete(taskFolder, true);
-                await LogToDb(taskId, $"Cleaned up task folder: {taskFolder}");
-            }
-            else
-            {
-                await SendSlackMessage(slack, $"❌ Could not deliver files via Slack or GitHub. Files have been preserved on the agent host for manual retrieval.");
-                await LogToDb(taskId, $"Warning: Files preserved at {taskFolder} due to delivery failure");
-                // Do NOT delete taskFolder - keep files for manual retrieval
-            }
+            Directory.Delete(taskFolder, true);
+            await LogToDb(taskId, $"Archived to luna-research and cleaned up task folder");
         }
         else
         {
-            await SendSlackMessage(slack, $"✅ All deliverables for task #{taskId} have been sent");
-            // Clean up the task folder only after successful delivery
-            Directory.Delete(taskFolder, true);
-            await LogToDb(taskId, $"Cleaned up task folder: {taskFolder}");
+            await SendSlackMessage(slack, $"⚠️ Could not archive to `{LunaResearchRepoName}`. Files preserved at {taskFolder} for manual retrieval.");
+            await LogToDb(taskId, $"Archive failed, files preserved at {taskFolder}");
         }
     }
     catch (Exception ex)
@@ -1264,7 +1394,26 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
             await SendSlackMessage(slack, $"📋 **Creating execution plan for task #{task.Id}...**");
             await LogThought(task.Id, 0, ThoughtType.Planning, "Running initializer: creating multi-step execution plan");
 
-            var initializerPrompt = $@"You are LUNA, an AI agent. Review this task and create a detailed multi-step execution plan.
+            // Check luna-research for prior context before planning
+            var priorResearchContext = "";
+            var lunaResearchPath = GetLunaResearchRepoPath();
+            var archivesPath = Path.Combine(lunaResearchPath, "archives");
+            if (Directory.Exists(archivesPath))
+            {
+                var projects = Directory.GetDirectories(archivesPath)
+                    .Select(d => Path.GetFileName(d))
+                    .OrderByDescending(n => n)
+                    .Take(MaxPriorProjectsToDisplay)
+                    .ToList();
+                if (projects.Count > 0)
+                {
+                    priorResearchContext = "\n\nExisting projects in the luna-research repository (check these for prior context before starting):\n" +
+                        string.Join("\n", projects.Select(p => $"- {p}")) +
+                        "\n\nIf any prior project is relevant to this task, incorporate that existing knowledge into your plan.";
+                }
+            }
+
+            var initializerPrompt = $@"You are LUNA, an AI agent. Review this task and create a detailed multi-step execution plan.{priorResearchContext}
 
 Task: {task.Description}
 
@@ -1586,9 +1735,9 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                 
                 if (!classification.IsCodeTask)
                 {
-                    // Non-coding task: deliver results via Slack and cleanup
-                    await LogThought(task.Id, iteration, ThoughtType.UserUpdate, "Delivering non-coding task results");
-                    await DeliverNonCodingTask(task.Id, taskFolder, slack);
+                    // Non-coding task: archive all results to luna-research repo
+                    await LogThought(task.Id, iteration, ThoughtType.UserUpdate, "Archiving non-coding task results to luna-research");
+                    await DeliverNonCodingTask(task.Id, task.Description, taskFolder, slack);
                 }
                 else
                 {
