@@ -39,6 +39,7 @@ var userGithubName = "";
 const double OllamaTemperature = 0.7;
 const int OllamaMaxTokens = 2048;
 const string OllamaDefaultModel = "gemma3:4b";
+const int OllamaDefaultTimeoutMinutes = 30; // Default timeout for Ollama HTTP requests (30 minutes for long-running tasks)
 
 // Task Processing Configuration
 const int MaxTaskIterations = 100;
@@ -106,8 +107,32 @@ await CleanupStaleContainers();
 var taskQueue = new Queue<WorkTask>();
 WorkTask? currentTask = null;
 var queueLock = new object();
+
+// Configure Ollama HTTP client with extended timeout for long-running AI tasks
+// Can be overridden via OLLAMA_TIMEOUT_MINUTES environment variable (max: 120 minutes)
+const int MaxOllamaTimeoutMinutes = 120; // Maximum allowed timeout to prevent indefinite hangs
+var ollamaTimeoutMinutes = OllamaDefaultTimeoutMinutes;
+var ollamaTimeoutEnv = Environment.GetEnvironmentVariable("OLLAMA_TIMEOUT_MINUTES");
+if (!string.IsNullOrEmpty(ollamaTimeoutEnv) && int.TryParse(ollamaTimeoutEnv, out var customTimeout) && customTimeout > 0)
+{
+    if (customTimeout > MaxOllamaTimeoutMinutes)
+    {
+        Console.WriteLine($"⚠️  OLLAMA_TIMEOUT_MINUTES value {customTimeout} exceeds maximum {MaxOllamaTimeoutMinutes}, using maximum");
+        ollamaTimeoutMinutes = MaxOllamaTimeoutMinutes;
+    }
+    else
+    {
+        ollamaTimeoutMinutes = customTimeout;
+    }
+    Console.WriteLine($"Using custom Ollama timeout: {ollamaTimeoutMinutes} minutes");
+}
+else
+{
+    Console.WriteLine($"Using default Ollama timeout: {ollamaTimeoutMinutes} minutes");
+}
+
 var httpClient = new HttpClient();
-httpClient.Timeout = TimeSpan.FromMinutes(5);
+httpClient.Timeout = TimeSpan.FromMinutes(ollamaTimeoutMinutes);
 
 // ============================================================================
 // Helper Functions
@@ -453,7 +478,7 @@ async Task<string> DoOnlineResearch(string query)
 {query}
 
 Provide key facts, recent developments, and relevant information.
-Keep the response under 500 words.";
+Keep the response under 500 words and be direct - do not ask follow-up questions.";
 
     var result = await CallOllama(researchPrompt);
     return result;
@@ -1216,16 +1241,17 @@ You can run commands in the container, create files, and use installed tools (gi
 You can use curl/wget to fetch data from the web, search for information, or download files.
 For web research, you can use the 'research' action or directly use curl/wget commands.
 
-IMPORTANT: Respond with ONLY valid JSON. Do NOT wrap your response in markdown code blocks or backticks.
+IMPORTANT: 
+- Respond with ONLY valid JSON. Do NOT wrap your response in markdown code blocks or backticks.
+- Do NOT ask follow-up questions - proceed with the task autonomously.
+- If the task is complete, use action "complete".
+- Only use action "need_input" if you CANNOT proceed without critical information from the user.
 
 {(contextHistory.Length > 0 ? $@"
 Previous iteration context:
 {contextHistory}
 
 Based on the above context, what is the next step?" : "What is the next step to complete this task? Provide a specific, executable action.")}
-
-If the task is complete, respond with action ""complete"".
-If you need user input, respond with action ""need_input"".
 
 Respond with ONLY this JSON format (no markdown, no code blocks):
 {{
