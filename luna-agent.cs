@@ -469,7 +469,7 @@ async Task<string> DoOnlineResearch(string query)
 {query}
 
 Provide key facts, recent developments, and relevant information.
-Keep the response under 500 words.";
+Keep the response under 500 words and be direct - do not ask follow-up questions.";
 
     var result = await CallOllama(researchPrompt);
     return result;
@@ -1232,16 +1232,17 @@ You can run commands in the container, create files, and use installed tools (gi
 You can use curl/wget to fetch data from the web, search for information, or download files.
 For web research, you can use the 'research' action or directly use curl/wget commands.
 
-IMPORTANT: Respond with ONLY valid JSON. Do NOT wrap your response in markdown code blocks or backticks.
+IMPORTANT: 
+- Respond with ONLY valid JSON. Do NOT wrap your response in markdown code blocks or backticks.
+- Do NOT ask follow-up questions - proceed with the task autonomously.
+- If the task is complete, use action "complete".
+- Only use action "need_input" if you CANNOT proceed without critical information from the user.
 
 {(contextHistory.Length > 0 ? $@"
 Previous iteration context:
 {contextHistory}
 
 Based on the above context, what is the next step?" : "What is the next step to complete this task? Provide a specific, executable action.")}
-
-If the task is complete, respond with action ""complete"".
-If you need user input, respond with action ""need_input"".
 
 Respond with ONLY this JSON format (no markdown, no code blocks):
 {{
