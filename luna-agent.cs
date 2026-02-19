@@ -42,9 +42,6 @@ const string OllamaDefaultModel = "gemma3:4b";
 
 // Task Processing Configuration
 const int MaxTaskIterations = 100;
-const int MaxSlackMessagePreviewLength = 500;
-const int MaxDescriptionPreviewLength = 50;
-const int MaxLogPreviewLength = 2000;
 const int MaxContextHistoryEntryLength = 5000;
 const int MaxErrorMessagePreviewLength = 2000;
 const int MaxIterationTimeSeconds = 180; // 3 minutes per iteration
@@ -184,6 +181,12 @@ async Task SendSlackMessage(ISlackApiClient slack, string message)
     {
         Console.WriteLine($"Error sending Slack message: {ex.Message}");
     }
+}
+
+string FormatOutput(string output, string label = "Output", bool useCodeBlock = true)
+{
+    var formattedOutput = useCodeBlock ? $"```{output}```" : output;
+    return $"📤 **{label}:**\n{formattedOutput}";
 }
 
 string CleanMarkdownFromResponse(string response)
@@ -402,7 +405,7 @@ async Task<string?> CreatePullRequest(int taskId, string branchName, string repo
     {
         // Commit changes
         await RunCommand("git add .", repoPath);
-        var commitMessage = $"LUNA Agent - Task #{taskId}: {taskDescription.Substring(0, Math.Min(MaxDescriptionPreviewLength, taskDescription.Length))}";
+        var commitMessage = $"LUNA Agent - Task #{taskId}: {taskDescription}";
         await RunCommand($"git commit -m \"{commitMessage}\"", repoPath);
         await LogToDb(taskId, "Changes committed");
 
@@ -1096,7 +1099,7 @@ async Task ProcessTask(WorkTask task, ISlackApiClient slack)
         // ============================================================================
         // INITIALIZER STEP: Create multi-step plan for the task
         // ============================================================================
-        await SendSlackMessage(slack, $"📋 Creating execution plan for task #{task.Id}...");
+        await SendSlackMessage(slack, $"📋 **Creating execution plan for task #{task.Id}...**");
         await LogThought(task.Id, 0, ThoughtType.Planning, "Running initializer: creating multi-step execution plan");
         
         var initializerPrompt = $@"You are LUNA, an AI agent. Review this task and create a detailed multi-step execution plan.
@@ -1123,7 +1126,7 @@ Respond with ONLY a JSON array of step descriptions (no markdown, no code blocks
                 var cleanedPlan = CleanMarkdownFromResponse(planResponse);
                 
                 var planArray = JsonDocument.Parse(cleanedPlan).RootElement;
-                var planSteps = new StringBuilder("📋 **Execution Plan:**\n");
+                var planSteps = new StringBuilder("📋 **Execution Plan Created:**\n");
                 int stepNum = 1;
                 foreach (var step in planArray.EnumerateArray())
                 {
@@ -1186,7 +1189,7 @@ Respond with ONLY a JSON array of step descriptions (no markdown, no code blocks
                 }
             }
             
-            var iterationMsg = $"⚙️ Iteration {iteration}/{MaxTaskIterations} for task #{task.Id}";
+            var iterationMsg = $"🔄 **Iteration {iteration}/{MaxTaskIterations}** for task #{task.Id}";
             await SendSlackMessage(slack, iterationMsg);
             await LogToDb(task.Id, $"Iteration {iteration} started");
             await LogThought(task.Id, iteration, ThoughtType.Observation, $"Starting iteration {iteration}");
@@ -1234,6 +1237,9 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
   ""question"": ""question if action is need_input""
 }}";
 
+            // Show thinking indicator to user
+            await SendSlackMessage(slack, $"🤔 AI is analyzing the task and determining next action...");
+            
             var aiResponse = await CallOllama(prompt);
             await LogToDb(task.Id, $"AI response: {aiResponse}");
             await LogThought(task.Id, iteration, ThoughtType.AIResponse, aiResponse);
@@ -1273,7 +1279,7 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                 if (action == "complete" || aiResponse.Contains("TASK_COMPLETE"))
                 {
                     completed = true;
-                    await SendSlackMessage(slack, $"✅ Task #{task.Id} completed!");
+                    await SendSlackMessage(slack, $"✅ **Task #{task.Id} completed!**\n🎯 AI has determined all objectives are met.");
                     await LogThought(task.Id, iteration, ThoughtType.UserUpdate, "Task completed successfully");
                     await UpdateTaskStatus(task.Id, TaskStatus.Completed, result: "Task completed successfully");
                     break;
@@ -1281,7 +1287,7 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                 else if (action == "need_input")
                 {
                     var question = actionDoc.RootElement.GetProperty("question").GetString() ?? "Need more information";
-                    await SendSlackMessage(slack, $"❓ Task #{task.Id} needs input: {question}");
+                    await SendSlackMessage(slack, $"❓ **Task #{task.Id} needs input:**\n{question}\n\n💡 Use `!prompt {task.Id} <your response>` to provide the information and resume the task.");
                     await LogThought(task.Id, iteration, ThoughtType.UserUpdate, $"Needs input: {question}");
                     await UpdateTaskStatus(task.Id, TaskStatus.Paused);
                     await LogToDb(task.Id, $"Waiting for user input: {question}");
@@ -1295,17 +1301,19 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                     
                     if (!string.IsNullOrEmpty(details))
                     {
-                        await SendSlackMessage(slack, $"💭 AI thinking: {details}");
+                        await SendSlackMessage(slack, $"💭 **AI Reasoning:** {details}");
                         contextHistory.AppendLine($"[Iteration {iteration}] Thought: {details}");
                     }
                     
-                    await SendSlackMessage(slack, $"💻 Running in container: `{command}`");
+                    await SendSlackMessage(slack, $"💻 **Executing command:**\n```{command}```");
                     await LogThought(task.Id, iteration, ThoughtType.Action, command, "command", command);
                     
                     var commandOutput = await RunCommandInContainer(containerId!, command);
                     await LogToDb(task.Id, $"Command output: {commandOutput}");
                     await LogThought(task.Id, iteration, ThoughtType.CommandOutput, commandOutput);
-                    await SendSlackMessage(slack, $"```{commandOutput.Substring(0, Math.Min(MaxSlackMessagePreviewLength, commandOutput.Length))}```");
+                    
+                    // Show command output
+                    await SendSlackMessage(slack, FormatOutput(commandOutput, "Output"));
                     
                     // Add to context history for next iteration
                     contextHistory.AppendLine($"[Iteration {iteration}] Executed: {command}");
@@ -1320,7 +1328,7 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                     
                     if (!string.IsNullOrEmpty(details))
                     {
-                        await SendSlackMessage(slack, $"💭 AI thinking: {details}");
+                        await SendSlackMessage(slack, $"💭 **AI Reasoning:** {details}");
                         contextHistory.AppendLine($"[Iteration {iteration}] Thought: {details}");
                     }
                     
@@ -1330,7 +1338,7 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                     await CopyFileToContainer(containerId!, tempFile, $"/workspace/{filePath}");
                     System.IO.File.Delete(tempFile);
                     
-                    await SendSlackMessage(slack, $"📄 Created file in container: {filePath}");
+                    await SendSlackMessage(slack, $"📄 **Created file:** `{filePath}`\n_{fileContent.Length} characters_");
                     await LogToDb(task.Id, $"Created file: {filePath}");
                     await LogThought(task.Id, iteration, ThoughtType.Action, $"Created file: {filePath}", "create_file", filePath);
                     
@@ -1340,14 +1348,16 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                 else if (action == "research")
                 {
                     var details = actionDoc.RootElement.GetProperty("details").GetString() ?? "";
-                    await SendSlackMessage(slack, $"🔍 Researching: {details}");
+                    await SendSlackMessage(slack, $"🔍 **Researching:** {details}");
                     await LogToDb(task.Id, $"Research: {details}");
                     await LogThought(task.Id, iteration, ThoughtType.Planning, $"Research: {details}");
                     
                     var researchResult = await DoOnlineResearch(details);
                     await LogToDb(task.Id, $"Research results: {researchResult}");
                     await LogThought(task.Id, iteration, ThoughtType.Observation, researchResult);
-                    await SendSlackMessage(slack, $"📚 Research summary: {researchResult.Substring(0, Math.Min(MaxSlackMessagePreviewLength, researchResult.Length))}");
+                    
+                    // Format research results without code block (plain text is more readable)
+                    await SendSlackMessage(slack, FormatOutput(researchResult, "Research Results", useCodeBlock: false));
                     
                     // Add to context history
                     contextHistory.AppendLine($"[Iteration {iteration}] Research: {details}");
@@ -1514,7 +1524,7 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                                 
                                 // Commit and push to main
                                 await RunCommand("git add .", repoPath);
-                                var sanitizedDescription = task.Description[..Math.Min(MaxDescriptionPreviewLength, task.Description.Length)]
+                                var sanitizedDescription = task.Description
                                     .Replace("\"", "\\\"")
                                     .Replace("$", "\\$")
                                     .Replace("`", "\\`")
@@ -1674,7 +1684,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
             statusMsg += $"**Queued Tasks:** {queuedTasks.Count}\n";
             foreach (var qt in queuedTasks.Take(5))
             {
-                statusMsg += $"  • #{qt.Id}: {qt.Description.Substring(0, Math.Min(MaxDescriptionPreviewLength, qt.Description.Length))}\n";
+                statusMsg += $"  • #{qt.Id}: {qt.Description}\n";
             }
 
             await SendSlackMessage(slack, statusMsg);
@@ -1707,10 +1717,10 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
 
                     await SendSlackMessage(slack, msg);
 
-                    // Send log separately if too long
+                    // Send log separately
                     if (!string.IsNullOrEmpty(task.Log))
                     {
-                        var logMsg = $"**Log for Task #{task.Id}:**\n```{task.Log.Substring(0, Math.Min(MaxLogPreviewLength, task.Log.Length))}```";
+                        var logMsg = $"**Log for Task #{task.Id}:**\n```{task.Log}```";
                         await SendSlackMessage(slack, logMsg);
                     }
                 }
@@ -1801,6 +1811,66 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
             else
             {
                 await SendSlackMessage(slack, "Usage: !update <task_id> <message>");
+            }
+        }
+        else if (text.StartsWith("!prompt"))
+        {
+            var parts = text.Split(' ', 3);
+            if (parts.Length >= 3 && int.TryParse(parts[1], out var taskId))
+            {
+                var promptText = parts[2];
+                using var db = new AgentDbContext();
+                var task = await db.Tasks.FindAsync(taskId);
+                if (task != null && task.Status == TaskStatus.Paused)
+                {
+                    // Store prompt response on task (replaces any previous prompt)
+                    task.UserPrompt = promptText;
+                    
+                    // Remove any previous prompt response from description and add new one
+                    var descLines = task.Description.Split('\n');
+                    var filteredDesc = string.Join('\n', descLines.Where(line => !line.StartsWith("User Prompt Response:")));
+                    task.Description = filteredDesc.TrimEnd() + $"\n\nUser Prompt Response: {promptText}";
+                    
+                    await db.SaveChangesAsync();
+                    
+                    // Log the prompt
+                    await LogToDb(taskId, $"User prompt response: {promptText}");
+                    await LogThought(taskId, 0, ThoughtType.UserUpdate, $"User provided prompt response: {promptText}");
+                    
+                    // Resume task by adding to front of queue
+                    lock (queueLock)
+                    {
+                        var queueList = taskQueue.ToList();
+                        queueList.RemoveAll(t => t.Id == taskId);
+                        taskQueue.Clear();
+                        
+                        // Add specified task at the front of queue
+                        taskQueue.Enqueue(task);
+                        
+                        // Re-add other tasks after it
+                        foreach (var t in queueList)
+                        {
+                            taskQueue.Enqueue(t);
+                        }
+                    }
+                    
+                    // Update task status to queued for auto-start
+                    await UpdateTaskStatus(taskId, TaskStatus.Queued);
+                    
+                    await SendSlackMessage(slack, $"✅ Prompt response saved for task #{taskId}. Task resumed and moved to front of queue.");
+                }
+                else if (task == null)
+                {
+                    await SendSlackMessage(slack, $"Task #{taskId} not found");
+                }
+                else
+                {
+                    await SendSlackMessage(slack, $"Cannot prompt task #{taskId} - task is not paused (current status: {task.Status})");
+                }
+            }
+            else
+            {
+                await SendSlackMessage(slack, "Usage: !prompt <task_id> <response>");
             }
         }
         else if (text.StartsWith("!start"))
@@ -1938,7 +2008,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
             var msg = $"📋 **Task Queue** ({queuedTasks.Count} tasks)\n\n";
             foreach (var qt in queuedTasks)
             {
-                msg += $"#{qt.Id} [{qt.Status}]: {qt.Description.Substring(0, Math.Min(MaxDescriptionPreviewLength, qt.Description.Length))}\n";
+                msg += $"#{qt.Id} [{qt.Status}]: {qt.Description}\n";
             }
 
             await SendSlackMessage(slack, msg.Length > 0 ? msg : "Queue is empty");
@@ -1955,6 +2025,7 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
 **!stop <task_id>** - Stop a task
 **!delete <task_id>** - Delete a task (can be used at any time, regardless of task state)
 **!update <task_id> <message>** - Send additional context to a running task
+**!prompt <task_id> <response>** - Provide prompt response to a paused task and resume it
 **!system** - Get current system status (CPU, RAM, temperature, Ollama)
 **!help** - Show this help message
 
@@ -2066,8 +2137,6 @@ var pollTask = Task.Run(async () =>
                     
                     if (history.Messages != null && history.Messages.Any())
                     {
-                        Console.WriteLine($"📨 Retrieved {history.Messages.Count} messages from channel");
-                        
                         // Get timestamp from message (Slack uses Unix seconds as string)
                         var newMessages = history.Messages
                             .Where(m => {
@@ -2097,6 +2166,7 @@ var pollTask = Task.Run(async () =>
                             .OrderBy(m => m.Timestamp)
                             .ToList();
 
+                        // Only log when new messages are found (reduces console chattiness)
                         if (newMessages.Count > 0)
                             Console.WriteLine($"📨 Found {newMessages.Count} new message(s)");
 
@@ -2194,6 +2264,7 @@ public class WorkTask
     public string Log { get; set; } = "";
     public string? ContainerId { get; set; }
     public string? ContainerName { get; set; }
+    public string? UserPrompt { get; set; }  // Stores the most recent prompt response for paused tasks
     
     // Navigation property for full agentic flow
     public List<AgenticThought> Thoughts { get; set; } = new();
