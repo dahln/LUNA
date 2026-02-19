@@ -1102,6 +1102,18 @@ async Task ProcessTask(WorkTask task, ISlackApiClient slack)
     string? containerId = null;
     try
     {
+        // Load execution history BEFORE logging any thoughts so that isResume accurately
+        // reflects whether the task has been run before (not counting this invocation).
+        List<AgenticThought> previousThoughts;
+        using (var historyDb = new AgentDbContext())
+        {
+            previousThoughts = await historyDb.Thoughts
+                .Where(t => t.TaskId == task.Id)
+                .OrderBy(t => t.IterationNumber).ThenBy(t => t.Id)
+                .ToListAsync();
+        }
+        var isResume = previousThoughts.Count > 0;
+
         await UpdateTaskStatus(task.Id, TaskStatus.Running);
         await SendSlackMessage(slack, $"🚀 Starting task #{task.Id}: {task.Description}");
         await LogToDb(task.Id, $"Task started: {task.Description}");
@@ -1122,12 +1134,136 @@ async Task ProcessTask(WorkTask task, ISlackApiClient slack)
         await LogThought(task.Id, 0, ThoughtType.Observation, "Docker container created successfully");
 
         // ============================================================================
-        // INITIALIZER STEP: Create multi-step plan for the task
+        // INITIALIZER STEP: Create or restore multi-step execution plan
         // ============================================================================
-        await SendSlackMessage(slack, $"📋 **Creating execution plan for task #{task.Id}...**");
-        await LogThought(task.Id, 0, ThoughtType.Planning, "Running initializer: creating multi-step execution plan");
-        
-        var initializerPrompt = $@"You are LUNA, an AI agent. Review this task and create a detailed multi-step execution plan.
+        var executionPlan = "";
+        var contextHistory = new StringBuilder();
+
+        if (isResume)
+        {
+            await SendSlackMessage(slack, $"🔄 **Resuming task #{task.Id} - reviewing previous execution history...**");
+            await LogThought(task.Id, 0, ThoughtType.Planning, "Resuming task: reviewing previous execution history");
+
+            // Restore previous execution plan from recorded thoughts
+            var previousPlanThought = previousThoughts
+                .Where(t => t.Type == ThoughtType.Planning && t.Content.StartsWith("📋"))
+                .OrderBy(t => t.Id)
+                .FirstOrDefault();
+            if (previousPlanThought != null)
+                executionPlan = previousPlanThought.Content;
+
+            // Rebuild context history from previous iteration thoughts
+            contextHistory.AppendLine(string.IsNullOrEmpty(executionPlan)
+                ? "No prior execution plan recorded."
+                : executionPlan);
+            foreach (var thought in previousThoughts.Where(t => t.IterationNumber > 0))
+            {
+                if (thought.Type == ThoughtType.Action)
+                {
+                    var entry = $"[Prev Iter {thought.IterationNumber}] Executed: {thought.Content}";
+                    contextHistory.AppendLine(entry.Length > MaxContextHistoryEntryLength
+                        ? entry.Substring(0, MaxContextHistoryEntryLength) : entry);
+                }
+                else if (thought.Type == ThoughtType.CommandOutput)
+                {
+                    var entry = $"Output: {thought.Content}";
+                    contextHistory.AppendLine(entry.Length > MaxContextHistoryEntryLength
+                        ? entry.Substring(0, MaxContextHistoryEntryLength) : entry);
+                }
+                else if (thought.Type == ThoughtType.Error)
+                {
+                    contextHistory.AppendLine($"[Prev Iter {thought.IterationNumber}] ERROR: {thought.Content}");
+                }
+            }
+
+            // Ask AI to review the previous plan and determine where to resume
+            var reviewPrompt = $@"You are LUNA, an AI agent resuming a previously paused task.
+
+Task: {task.Description}
+
+Previous execution plan:
+{(string.IsNullOrEmpty(executionPlan) ? "No plan recorded" : executionPlan)}
+
+Previous execution history:
+{contextHistory}
+
+Review the previous plan and execution history. Determine if the plan is still valid and what step to resume from. If the plan needs significant adjustment, provide an updated plan.
+
+Respond with ONLY a JSON object (no markdown, no code blocks):
+{{
+  ""planIsValid"": true or false,
+  ""resumeSummary"": ""brief description of what was accomplished and what needs to be done next"",
+  ""updatedPlan"": [""step 1"", ""step 2"", ...] or null if original plan is still valid
+}}";
+
+            var reviewResponse = await CallOllama(reviewPrompt);
+            if (!string.IsNullOrEmpty(reviewResponse))
+            {
+                try
+                {
+                    var cleanedReview = CleanMarkdownFromResponse(reviewResponse);
+                    var reviewDoc = JsonDocument.Parse(cleanedReview);
+                    var root = reviewDoc.RootElement;
+
+                    var planIsValid = root.TryGetProperty("planIsValid", out var validProp) && validProp.GetBoolean();
+                    var resumeSummary = root.TryGetProperty("resumeSummary", out var summaryProp)
+                        ? summaryProp.GetString() ?? "" : "";
+
+                    await SendSlackMessage(slack, $"🔍 **Resume Assessment:**\n{resumeSummary}");
+                    await LogThought(task.Id, 0, ThoughtType.Planning, $"Resume assessment: {resumeSummary}");
+
+                    // If plan needs updating, build an updated plan from the AI response
+                    if (!planIsValid
+                        && root.TryGetProperty("updatedPlan", out var updatedPlanProp)
+                        && updatedPlanProp.ValueKind == JsonValueKind.Array)
+                    {
+                        var planSteps = new StringBuilder("📋 **Updated Execution Plan:**\n");
+                        int stepNum = 1;
+                        foreach (var step in updatedPlanProp.EnumerateArray())
+                        {
+                            planSteps.AppendLine($"{stepNum}. {step.GetString()}");
+                            stepNum++;
+                        }
+                        executionPlan = planSteps.ToString();
+
+                        // Replace the plan at the start of context history with the updated plan
+                        var updatedContext = new StringBuilder(executionPlan);
+                        foreach (var line in contextHistory.ToString().Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).Skip(1))
+                            updatedContext.AppendLine(line);
+                        contextHistory.Clear();
+                        contextHistory.Append(updatedContext);
+
+                        await SendSlackMessage(slack, executionPlan);
+                        await LogThought(task.Id, 0, ThoughtType.Planning, executionPlan);
+                    }
+                    else if (!string.IsNullOrEmpty(executionPlan))
+                    {
+                        await SendSlackMessage(slack, $"✅ Previous execution plan is still valid. Resuming.\n{executionPlan}");
+                    }
+
+                    // Append resume context so the AI knows where to continue from
+                    contextHistory.AppendLine($"\n[RESUME] Task is being resumed. {resumeSummary}");
+                }
+                catch (Exception ex)
+                {
+                    await LogThought(task.Id, 0, ThoughtType.Error, $"Failed to parse resume assessment: {ex.Message}");
+                    await SendSlackMessage(slack, "⚠️ Could not parse resume assessment, continuing with previous context...");
+                    contextHistory.AppendLine("\n[RESUME] Task is being resumed from previous state.");
+                }
+            }
+            else
+            {
+                await SendSlackMessage(slack, "⚠️ Could not get resume assessment, continuing with previous context...");
+                contextHistory.AppendLine("\n[RESUME] Task is being resumed from previous state.");
+            }
+        }
+        else
+        {
+            // New task: create a fresh multi-step execution plan
+            await SendSlackMessage(slack, $"📋 **Creating execution plan for task #{task.Id}...**");
+            await LogThought(task.Id, 0, ThoughtType.Planning, "Running initializer: creating multi-step execution plan");
+
+            var initializerPrompt = $@"You are LUNA, an AI agent. Review this task and create a detailed multi-step execution plan.
 
 Task: {task.Description}
 
@@ -1140,56 +1276,55 @@ Respond with ONLY a JSON array of step descriptions (no markdown, no code blocks
   ""Step 2 description"",
   ...
 ]";
-        
-        var planResponse = await CallOllama(initializerPrompt);
-        var executionPlan = ""; // Store plan for context
-        if (!string.IsNullOrEmpty(planResponse))
-        {
-            try
+
+            var planResponse = await CallOllama(initializerPrompt);
+            if (!string.IsNullOrEmpty(planResponse))
             {
-                // Clean up markdown if present
-                var cleanedPlan = CleanMarkdownFromResponse(planResponse);
-                
-                var planArray = JsonDocument.Parse(cleanedPlan).RootElement;
-                var planSteps = new StringBuilder("📋 **Execution Plan Created:**\n");
-                int stepNum = 1;
-                foreach (var step in planArray.EnumerateArray())
+                try
                 {
-                    planSteps.AppendLine($"{stepNum}. {step.GetString()}");
-                    stepNum++;
+                    // Clean up markdown if present
+                    var cleanedPlan = CleanMarkdownFromResponse(planResponse);
+
+                    var planArray = JsonDocument.Parse(cleanedPlan).RootElement;
+                    var planSteps = new StringBuilder("📋 **Execution Plan Created:**\n");
+                    int stepNum = 1;
+                    foreach (var step in planArray.EnumerateArray())
+                    {
+                        planSteps.AppendLine($"{stepNum}. {step.GetString()}");
+                        stepNum++;
+                    }
+
+                    executionPlan = planSteps.ToString();
+                    await SendSlackMessage(slack, executionPlan);
+                    await LogThought(task.Id, 0, ThoughtType.Planning, executionPlan);
                 }
-                
-                executionPlan = planSteps.ToString();
-                await SendSlackMessage(slack, executionPlan);
-                await LogThought(task.Id, 0, ThoughtType.Planning, executionPlan);
+                catch (Exception ex)
+                {
+                    await LogThought(task.Id, 0, ThoughtType.Error, $"Failed to parse plan: {ex.Message}. Continuing without formal plan.");
+                    await SendSlackMessage(slack, "⚠️ Could not create structured plan, proceeding with task...");
+                }
             }
-            catch (Exception ex)
+            else
             {
-                await LogThought(task.Id, 0, ThoughtType.Error, $"Failed to parse plan: {ex.Message}. Continuing without formal plan.");
-                await SendSlackMessage(slack, "⚠️ Could not create structured plan, proceeding with task...");
+                await SendSlackMessage(slack, "⚠️ Initializer did not respond, proceeding with task...");
             }
-        }
-        else
-        {
-            await SendSlackMessage(slack, "⚠️ Initializer did not respond, proceeding with task...");
+
+            // Add execution plan to initial context if available
+            if (!string.IsNullOrEmpty(executionPlan))
+            {
+                contextHistory.AppendLine(executionPlan);
+            }
         }
 
         // Agentic loop with iteration
         var iteration = 0;
         var completed = false;
         var workingDir = "/workspace";
-        var contextHistory = new StringBuilder();
         // Track consecutive empty AI responses across iterations
         // Note: CallOllama has its own retry logic (up to MaxOllamaRetries retries per call)
         // If CallOllama exhausts retries and returns empty, ollamaFailureCount increments
         // After MaxOllamaRetries consecutive empty responses (across iterations), pause task
         var ollamaFailureCount = 0;
-        
-        // Add execution plan to initial context if available
-        if (!string.IsNullOrEmpty(executionPlan))
-        {
-            contextHistory.AppendLine(executionPlan);
-        }
 
         while (!completed && iteration < MaxTaskIterations && task.Status != TaskStatus.Stopped)
         {
@@ -2115,27 +2250,27 @@ Console.WriteLine($"Agent User ID: {agentUserId}");
 
 await SendSlackMessage(client, "🚀 LUNA Agent is online and ready!");
 
-// Load any previously queued tasks from database into queue
-Console.WriteLine("Loading queued tasks from database...");
+// Load any previously queued or paused tasks from database into queue
+Console.WriteLine("Loading pending tasks from database...");
 using (var db = new AgentDbContext())
 {
-    var queuedTasks = db.Tasks
-        .Where(t => t.Status == TaskStatus.Queued)
+    var pendingTasks = db.Tasks
+        .Where(t => t.Status == TaskStatus.Queued || t.Status == TaskStatus.Paused)
         .OrderBy(t => t.CreatedAt)
         .ToList();
     
     lock (queueLock)
     {
-        foreach (var task in queuedTasks)
+        foreach (var task in pendingTasks)
         {
             taskQueue.Enqueue(task);
         }
     }
     
-    if (queuedTasks.Count > 0)
+    if (pendingTasks.Count > 0)
     {
-        Console.WriteLine($"Loaded {queuedTasks.Count} queued tasks");
-        await SendSlackMessage(client, $"📋 Loaded {queuedTasks.Count} queued task(s) from previous session");
+        Console.WriteLine($"Loaded {pendingTasks.Count} pending tasks");
+        await SendSlackMessage(client, $"📋 Loaded {pendingTasks.Count} pending task(s) from previous session");
     }
 }
 
