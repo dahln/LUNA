@@ -27,7 +27,7 @@ using Octokit;
 // Configuration
 // ============================================================================
 
-var slackConfigFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".luna", "luna.env");
+var lunaConfigFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".luna", "luna.env");
 var dbPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".luna-agent", "tasks.db");
 var slackBotToken = "";
 var slackAppToken = "";
@@ -62,9 +62,9 @@ const int MaxGitCommitMessageLength = 72;
 const int MaxPriorProjectsToDisplay = 20;
 
 // Load configuration from file
-if (System.IO.File.Exists(slackConfigFile))
+if (System.IO.File.Exists(lunaConfigFile))
 {
-    foreach (var line in System.IO.File.ReadAllLines(slackConfigFile))
+    foreach (var line in System.IO.File.ReadAllLines(lunaConfigFile))
     {
         if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#")) continue;
         var parts = line.Split('=', 2);
