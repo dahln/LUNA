@@ -495,9 +495,10 @@ Send these commands as regular messages in the `#agent` channel (use `!` prefix 
 - `!status` - Show current task and queue status
 - `!details <task_id>` - Get detailed information about a specific task
 - `!queue` - List all queued and paused tasks
-- `!pause <task_id>` - Pause a queued task
-- `!start <task_id>` - Start a task (pauses current task if running, starts or resumes specified task)
+- `!pause <task_id>` - Pause a queued task (removes from queue, next task starts automatically)
+- `!start <task_id>` - Start a task (pauses current task if running, moves specified task to front of queue)
 - `!stop <task_id>` - Stop a running or queued task
+- `!delete <task_id>` - Delete a task (can be used at any time, regardless of task state)
 - `!help` - Display help message with all commands
 
 **Creating Tasks:**
@@ -520,6 +521,7 @@ The agent will:
 
 **Task Management:**
 - Tasks are processed one at a time (queued execution)
+- Each task begins with an **initializer step** that creates a multi-step execution plan
 - Each task is logged in `~/.luna/tasks.db`
 - Full agentic flow captured in database:
   - All AI thoughts and planning steps
@@ -527,8 +529,12 @@ The agent will:
   - Command outputs and observations
   - Action details and results
 - Agent can iterate up to 100 times per task
+- Each iteration has a **3-minute time limit** - if reached, progress is saved and continues in next iteration
+- **Automatic retry** for Ollama AI failures (up to 3 retries with exponential backoff)
+- If AI fails 3 consecutive times, task is automatically paused and next queued task starts
 - Agent will ask for user input if needed
 - All interactions are logged to facilitate task resume/restart
+- Queued tasks are automatically restored from database when agent restarts
 
 **Security Notes:**
 - The agent does **NOT** have root access on the host system
