@@ -57,6 +57,7 @@ const string MarkdownCodeBlockPrefix = "```";
 
 // Luna Research Repository
 const string LunaResearchRepoName = "luna-research";
+const string LunaResearchTasksSubdir = "tasks";
 const int MaxSanitizedTitleLength = 60;
 const int MaxGitCommitMessageLength = 72;
 const int MaxPriorProjectsToDisplay = 20;
@@ -603,6 +604,7 @@ async Task<bool> EnsureLunaResearchRepo()
             {
                 // Folder and git repo exist - pull to get latest and verify connection
                 Console.WriteLine($"luna-research folder exists, pulling latest changes...");
+                await RunCommand("git config credential.helper '!gh auth git-credential'", repoPath);
                 var pullOutput = await RunCommand("git pull", repoPath);
                 Console.WriteLine($"Pull output: {pullOutput}");
 
@@ -644,9 +646,10 @@ async Task<bool> EnsureLunaResearchRepo()
             return false;
         }
 
-        // Configure git identity
+        // Configure git identity and credential helper
         await RunCommand("git config user.name \"LUNA Agent\"", repoPath);
         await RunCommand("git config user.email \"luna-agent@localhost\"", repoPath);
+        await RunCommand("git config credential.helper '!gh auth git-credential'", repoPath);
 
         // Ensure the repo has at least one commit (needed for pushes to work)
         var readmePath = Path.Combine(repoPath, "README.md");
@@ -693,9 +696,10 @@ async Task<string?> ArchiveToLunaResearch(int taskId, string taskTitle, string t
             return null;
         }
 
-        // Configure git identity
+        // Configure git identity and credential helper
         await RunCommand("git config user.name \"LUNA Agent\"", repoPath);
         await RunCommand("git config user.email \"luna-agent@localhost\"", repoPath);
+        await RunCommand("git config credential.helper '!gh auth git-credential'", repoPath);
 
         // Pull latest to avoid conflicts
         var defaultBranch = await RunCommand("git symbolic-ref --short HEAD", repoPath);
@@ -730,6 +734,16 @@ async Task<string?> ArchiveToLunaResearch(int taskId, string taskTitle, string t
         }
 
         await LogToDb(taskId, $"Copied files to luna-research: {archiveRelativePath}");
+
+        // If the task folder is inside the research repo (e.g. tasks/luna-task-N), remove it before
+        // staging so that only the archive path is committed rather than both copies.
+        var normalizedRepoPath = Path.GetFullPath(repoPath).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var normalizedTaskFolder = Path.GetFullPath(taskFolder);
+        if (normalizedTaskFolder.StartsWith(normalizedRepoPath, StringComparison.OrdinalIgnoreCase) &&
+            Directory.Exists(taskFolder))
+        {
+            Directory.Delete(taskFolder, true);
+        }
 
         // Git add, commit, push from host
         await RunCommand("git add .", repoPath);
@@ -1063,7 +1077,10 @@ async Task DeliverNonCodingTask(int taskId, string taskTitle, string taskFolder,
             {
                 await SendSlackMessage(slack, $"👤 {userGithubName} has collaborator access to the `{LunaResearchRepoName}` repository");
             }
-            Directory.Delete(taskFolder, true);
+            // The task folder may have already been removed inside ArchiveToLunaResearch when it was
+            // located within the research repo; only delete it if it still exists.
+            if (Directory.Exists(taskFolder))
+                Directory.Delete(taskFolder, true);
             await LogToDb(taskId, $"Archived to luna-research and cleaned up task folder");
         }
         else
@@ -1732,9 +1749,20 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
         // If task is completed, handle deliverables based on task type
         if (completed)
         {
-            // Create task-specific folder in home directory (sibling to luna execution directory)
-            var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            var taskFolder = Path.Combine(homeDir, $"luna-task-{task.Id}");
+            // Create task-specific folder inside luna-research repo so deliverables are never left in the home directory.
+            // If the research repo is not available, fall back to the home directory as a last resort.
+            string taskFolder;
+            var researchRepoReady = await EnsureLunaResearchRepo();
+            if (researchRepoReady)
+            {
+                var researchRepoPath = GetLunaResearchRepoPath();
+                taskFolder = Path.Combine(researchRepoPath, LunaResearchTasksSubdir, $"luna-task-{task.Id}");
+            }
+            else
+            {
+                var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                taskFolder = Path.Combine(homeDir, $"luna-task-{task.Id}");
+            }
             Directory.CreateDirectory(taskFolder);
             
             // Copy files from container to task folder
