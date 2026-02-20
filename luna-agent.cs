@@ -57,7 +57,6 @@ const string MarkdownCodeBlockPrefix = "```";
 
 // Luna Research Repository
 const string LunaResearchRepoName = "luna-research";
-const string LunaResearchTasksSubdir = "tasks";
 const int MaxSanitizedTitleLength = 60;
 const int MaxGitCommitMessageLength = 72;
 const int MaxPriorProjectsToDisplay = 20;
@@ -735,7 +734,7 @@ async Task<string?> ArchiveToLunaResearch(int taskId, string taskTitle, string t
 
         await LogToDb(taskId, $"Copied files to luna-research: {archiveRelativePath}");
 
-        // If the task folder is inside the research repo (e.g. tasks/luna-task-N), remove it before
+        // If the task folder is inside the research repo (e.g. task-{id}-{slug}), remove it before
         // staging so that only the archive path is committed rather than both copies.
         var normalizedRepoPath = Path.GetFullPath(repoPath).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         var normalizedTaskFolder = Path.GetFullPath(taskFolder);
@@ -1756,7 +1755,14 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
             if (researchRepoReady)
             {
                 var researchRepoPath = GetLunaResearchRepoPath();
-                taskFolder = Path.Combine(researchRepoPath, LunaResearchTasksSubdir, $"luna-task-{task.Id}");
+                // Build a short slug (2-4 words) from the task description for the folder name
+                var words = task.Description
+                    .Split(new[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(w => new string(w.Select(c => char.IsLetterOrDigit(c) ? char.ToLower(c) : '-').ToArray()).Trim('-'))
+                    .Where(w => w.Length > 0)
+                    .Take(4);
+                var slug = string.Join("-", words);
+                taskFolder = Path.Combine(researchRepoPath, $"task-{task.Id}-{slug}");
             }
             else
             {
