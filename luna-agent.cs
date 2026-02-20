@@ -107,6 +107,14 @@ using (var db = new AgentDbContext())
 Console.WriteLine("🧹 Cleaning up stale Docker containers...");
 await CleanupStaleContainers();
 
+// Configure global git authentication so all git clone/pull/push operations work
+Console.WriteLine("⚙️  Configuring global git authentication...");
+var gitCredResult = await RunCommand("git config --global credential.helper '!gh auth git-credential'");
+var gitNameResult = await RunCommand("git config --global user.name \"LUNA Agent\"");
+var gitEmailResult = await RunCommand("git config --global user.email \"luna-agent@localhost\"");
+if (gitCredResult.StartsWith("Error (exit") || gitNameResult.StartsWith("Error (exit") || gitEmailResult.StartsWith("Error (exit"))
+    Console.WriteLine($"⚠️  Warning: git global config may not be fully set up: cred={gitCredResult.Trim()} name={gitNameResult.Trim()} email={gitEmailResult.Trim()}");
+
 // Bootstrap luna-research repository on host
 Console.WriteLine("🔬 Bootstrapping luna-research repository...");
 await EnsureLunaResearchRepo();
@@ -200,6 +208,22 @@ async Task UpdateTaskStatus(int taskId, TaskStatus status, string? errorMessage 
     }
 }
 
+async Task WriteSlackLog(string direction, string message)
+{
+    try
+    {
+        var logsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "luna-logs");
+        Directory.CreateDirectory(logsDir);
+        var logFile = Path.Combine(logsDir, $"{DateTime.Now:yyyy-MM-dd}.md");
+        var entry = $"## [{DateTime.Now:HH:mm:ss}] {direction}\n\n{message}\n\n---\n\n";
+        await System.IO.File.AppendAllTextAsync(logFile, entry);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to write Slack log: {ex.Message}");
+    }
+}
+
 async Task SendSlackMessage(ISlackApiClient slack, string message)
 {
     try
@@ -217,6 +241,7 @@ async Task SendSlackMessage(ISlackApiClient slack, string message)
     {
         Console.WriteLine($"Error sending Slack message: {ex.Message}");
     }
+    await WriteSlackLog("OUTGOING", message);
 }
 
 string FormatOutput(string output, string label = "Output", bool useCodeBlock = true)
@@ -670,7 +695,17 @@ async Task<bool> EnsureLunaResearchRepo()
             System.Text.RegularExpressions.Regex.IsMatch(userGithubName, @"^[a-zA-Z0-9-]+$"))
         {
             Console.WriteLine($"Adding {userGithubName} as collaborator to {LunaResearchRepoName}");
-            await RunCommand($"gh repo add-collaborator {LunaResearchRepoName} {userGithubName} --permission push");
+            var collabOwnerOutput = await RunCommand("gh api user --jq .login");
+            var collabOwner = collabOwnerOutput.Trim();
+            if (!string.IsNullOrEmpty(collabOwner) && !collabOwner.StartsWith("Error (exit"))
+            {
+                var collabResult = await RunCommand($"gh api repos/{collabOwner}/{LunaResearchRepoName}/collaborators/{userGithubName} -X PUT -f permission=push");
+                Console.WriteLine($"Add collaborator result: {collabResult}");
+            }
+            else
+            {
+                Console.WriteLine($"Warning: Could not determine current GitHub user for collaborator setup");
+            }
         }
 
         return Directory.Exists(gitDir);
@@ -1017,7 +1052,7 @@ async Task<string?> CreateNewGithubRepo(int taskId, string taskDescription, ISla
                 var currentUserOutput = await RunCommand("gh api user --jq .login");
                 var currentUser = currentUserOutput.Trim();
                 
-                if (string.IsNullOrEmpty(currentUser) || currentUser.Contains("error"))
+                if (string.IsNullOrEmpty(currentUser) || currentUser.StartsWith("Error (exit"))
                 {
                     await LogToDb(taskId, $"Could not determine current GitHub user");
                     await SendSlackMessage(slack, $"⚠️ Could not add collaborator - authentication issue");
@@ -1237,7 +1272,7 @@ async Task<string?> CreateRepoForDeliverables(int taskId, string taskFolder, ISl
                 var currentUserOutput = await RunCommand("gh api user --jq .login");
                 var currentUser = currentUserOutput.Trim();
                 
-                if (!string.IsNullOrEmpty(currentUser) && !currentUser.Contains("error"))
+                if (!string.IsNullOrEmpty(currentUser) && !currentUser.StartsWith("Error (exit"))
                 {
                     await RunCommand($"gh api repos/{currentUser}/{repoName}/collaborators/{userGithubName} -X PUT -f permission=push");
                 }
@@ -1305,6 +1340,7 @@ async Task ProcessTask(WorkTask task, ISlackApiClient slack)
         // INITIALIZER STEP: Create or restore multi-step execution plan
         // ============================================================================
         var executionPlan = "";
+        var executionPlanSteps = new List<string>(); // Individual steps for tracking
         var contextHistory = new StringBuilder();
 
         if (isResume)
@@ -1385,11 +1421,14 @@ Respond with ONLY a JSON object (no markdown, no code blocks):
                         && root.TryGetProperty("updatedPlan", out var updatedPlanProp)
                         && updatedPlanProp.ValueKind == JsonValueKind.Array)
                     {
+                        executionPlanSteps.Clear();
                         var planSteps = new StringBuilder("📋 **Updated Execution Plan:**\n");
                         int stepNum = 1;
                         foreach (var step in updatedPlanProp.EnumerateArray())
                         {
-                            planSteps.AppendLine($"{stepNum}. {step.GetString()}");
+                            var stepText = step.GetString() ?? "";
+                            executionPlanSteps.Add(stepText);
+                            planSteps.AppendLine($"{stepNum}. {stepText}");
                             stepNum++;
                         }
                         executionPlan = planSteps.ToString();
@@ -1477,7 +1516,9 @@ Respond with ONLY a JSON array of step descriptions (no markdown, no code blocks
                     int stepNum = 1;
                     foreach (var step in planArray.EnumerateArray())
                     {
-                        planSteps.AppendLine($"{stepNum}. {step.GetString()}");
+                        var stepText = step.GetString() ?? "";
+                        executionPlanSteps.Add(stepText);
+                        planSteps.AppendLine($"{stepNum}. {stepText}");
                         stepNum++;
                     }
 
@@ -1536,7 +1577,7 @@ Respond with ONLY a JSON array of step descriptions (no markdown, no code blocks
                 }
             }
             
-            var iterationMsg = $"🔄 **Iteration {iteration}/{MaxTaskIterations}** for task #{task.Id}";
+            var iterationMsg = $"🔄 **Iteration {iteration}/{MaxTaskIterations}** — Task #{task.Id}";
             await SendSlackMessage(slack, iterationMsg);
             await LogToDb(task.Id, $"Iteration {iteration} started");
             await LogThought(task.Id, iteration, ThoughtType.Observation, $"Starting iteration {iteration}");
@@ -1555,9 +1596,13 @@ Respond with ONLY a JSON array of step descriptions (no markdown, no code blocks
             }
 
             // Build context-aware prompt with history from previous iterations
+            var planSection = executionPlanSteps.Count > 0
+                ? $"\n\nEXECUTION PLAN (follow these steps strictly in order — do NOT skip, repeat, or reorder them):\n{string.Join("\n", executionPlanSteps.Select((s, i) => $"{i + 1}. {s}"))}\n\nReview the context history below to determine which step has been completed last, then execute ONLY the next uncompleted step."
+                : "";
             var prompt = $@"You are LUNA, an AI agent running in an isolated Docker container. Current task: {task.Description}
 Iteration: {iteration}
 Working directory: {workingDir}
+{planSection}
 
 You can run commands in the container, create files, and use installed tools (git, curl, wget, build-essential).
 You can use curl/wget to fetch data from the web, search for information, or download files.
@@ -1578,20 +1623,27 @@ IMPORTANT:
 Previous iteration context:
 {contextHistory}
 
-Based on the above context, what is the next step?" : "What is the next step to complete this task? Provide a specific, executable action.")}
+Based on the above context and the execution plan, what is the next step?" : "What is the next step to complete this task? Provide a specific, executable action.")}
 
 Respond with ONLY this JSON format (no markdown, no code blocks):
 {{
   ""action"": ""command"" or ""create_file"" or ""research"" or ""complete"" or ""need_input"",
-  ""details"": ""specific details"",
+  ""details"": ""specific details of what you are doing and why (be descriptive)"",
   ""command"": ""bash command if action is command"",
   ""file_path"": ""path relative to /workspace if action is create_file"",
   ""file_content"": ""content if action is create_file"",
   ""question"": ""question if action is need_input""
 }}";
 
-            // Show thinking indicator to user
-            await SendSlackMessage(slack, $"🤔 AI is analyzing the task and determining next action...");
+            // Log the plan section being used (console only, not Slack)
+            if (executionPlanSteps.Count > 0)
+                Console.WriteLine($"📋 Iteration {iteration}: Following execution plan with {executionPlanSteps.Count} steps");
+
+            // Show thinking indicator to user with context about what step is being worked on
+            var thinkingMsg = executionPlanSteps.Count > 0
+                ? $"🤔 **Iteration {iteration}**: AI is determining the next step from the execution plan..."
+                : $"🤔 **Iteration {iteration}**: AI is analyzing the task and determining next action...";
+            await SendSlackMessage(slack, thinkingMsg);
             
             var aiResponse = await CallOllama(prompt);
             await LogToDb(task.Id, $"AI response: {aiResponse}");
@@ -1625,9 +1677,23 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
             {
                 var actionDoc = JsonDocument.Parse(cleanedResponse);
                 var action = actionDoc.RootElement.GetProperty("action").GetString();
+                var actionDetails = actionDoc.RootElement.TryGetProperty("details", out var actionDetailsEl)
+                    ? actionDetailsEl.GetString() ?? "" : "";
                 
                 // Reset failure count only after successful parse
                 ollamaFailureCount = 0;
+
+                // Log verbose AI decision to Slack
+                var actionSummary = action switch
+                {
+                    "command" => $"run command: `{(actionDoc.RootElement.TryGetProperty("command", out var cmdEl) ? cmdEl.GetString() : "")}`",
+                    "create_file" => $"create/update file: `{(actionDoc.RootElement.TryGetProperty("file_path", out var fpEl) ? fpEl.GetString() : "")}`",
+                    "research" => $"research: {actionDetails}",
+                    "complete" => "mark task complete",
+                    "need_input" => "request user input",
+                    _ => action
+                };
+                await SendSlackMessage(slack, $"🧠 **AI Decision (iter {iteration}):** {actionSummary}\n💬 **Reasoning:** {actionDetails}");
 
                 if (action == "complete" || aiResponse.Contains("TASK_COMPLETE"))
                 {
@@ -1653,10 +1719,7 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                         ? detailsElement.GetString() : "";
                     
                     if (!string.IsNullOrEmpty(details))
-                    {
-                        await SendSlackMessage(slack, $"💭 **AI Reasoning:** {details}");
                         contextHistory.AppendLine($"[Iteration {iteration}] Thought: {details}");
-                    }
                     
                     await SendSlackMessage(slack, $"💻 **Executing command:**\n```{command}```");
                     await LogThought(task.Id, iteration, ThoughtType.Action, command, "command", command);
@@ -1684,10 +1747,7 @@ Respond with ONLY this JSON format (no markdown, no code blocks):
                         ? detailsElement.GetString() : "";
                     
                     if (!string.IsNullOrEmpty(details))
-                    {
-                        await SendSlackMessage(slack, $"💭 **AI Reasoning:** {details}");
                         contextHistory.AppendLine($"[Iteration {iteration}] Thought: {details}");
-                    }
                     
                     // Normalize the file path: strip any leading workingDir or / prefix so it is always relative
                     if (filePath.StartsWith($"{workingDir}/"))
@@ -2049,6 +2109,9 @@ async Task HandleSlackMessage(MessageEvent message, ISlackApiClient slack)
             return;
 
         var text = message.Text?.Trim() ?? "";
+
+        // Log incoming user message
+        await WriteSlackLog("INCOMING", $"User {message.User}: {text}");
 
         // Parse commands (use ! prefix since Slack intercepts / as slash commands)
         if (text.StartsWith("!status"))
