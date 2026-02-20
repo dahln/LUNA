@@ -109,9 +109,11 @@ await CleanupStaleContainers();
 
 // Configure global git authentication so all git clone/pull/push operations work
 Console.WriteLine("⚙️  Configuring global git authentication...");
-await RunCommand("git config --global credential.helper '!gh auth git-credential'");
-await RunCommand("git config --global user.name \"LUNA Agent\"");
-await RunCommand("git config --global user.email \"luna-agent@localhost\"");
+var gitCredResult = await RunCommand("git config --global credential.helper '!gh auth git-credential'");
+var gitNameResult = await RunCommand("git config --global user.name \"LUNA Agent\"");
+var gitEmailResult = await RunCommand("git config --global user.email \"luna-agent@localhost\"");
+if (gitCredResult.StartsWith("Error (exit") || gitNameResult.StartsWith("Error (exit") || gitEmailResult.StartsWith("Error (exit"))
+    Console.WriteLine($"⚠️  Warning: git global config may not be fully set up: cred={gitCredResult.Trim()} name={gitNameResult.Trim()} email={gitEmailResult.Trim()}");
 
 // Bootstrap luna-research repository on host
 Console.WriteLine("🔬 Bootstrapping luna-research repository...");
@@ -695,7 +697,7 @@ async Task<bool> EnsureLunaResearchRepo()
             Console.WriteLine($"Adding {userGithubName} as collaborator to {LunaResearchRepoName}");
             var collabOwnerOutput = await RunCommand("gh api user --jq .login");
             var collabOwner = collabOwnerOutput.Trim();
-            if (!string.IsNullOrEmpty(collabOwner) && !collabOwner.Contains("error"))
+            if (!string.IsNullOrEmpty(collabOwner) && !collabOwner.StartsWith("Error (exit"))
             {
                 var collabResult = await RunCommand($"gh api repos/{collabOwner}/{LunaResearchRepoName}/collaborators/{userGithubName} -X PUT -f permission=push");
                 Console.WriteLine($"Add collaborator result: {collabResult}");
@@ -1050,7 +1052,7 @@ async Task<string?> CreateNewGithubRepo(int taskId, string taskDescription, ISla
                 var currentUserOutput = await RunCommand("gh api user --jq .login");
                 var currentUser = currentUserOutput.Trim();
                 
-                if (string.IsNullOrEmpty(currentUser) || currentUser.Contains("error"))
+                if (string.IsNullOrEmpty(currentUser) || currentUser.StartsWith("Error (exit"))
                 {
                     await LogToDb(taskId, $"Could not determine current GitHub user");
                     await SendSlackMessage(slack, $"⚠️ Could not add collaborator - authentication issue");
@@ -1270,7 +1272,7 @@ async Task<string?> CreateRepoForDeliverables(int taskId, string taskFolder, ISl
                 var currentUserOutput = await RunCommand("gh api user --jq .login");
                 var currentUser = currentUserOutput.Trim();
                 
-                if (!string.IsNullOrEmpty(currentUser) && !currentUser.Contains("error"))
+                if (!string.IsNullOrEmpty(currentUser) && !currentUser.StartsWith("Error (exit"))
                 {
                     await RunCommand($"gh api repos/{currentUser}/{repoName}/collaborators/{userGithubName} -X PUT -f permission=push");
                 }
